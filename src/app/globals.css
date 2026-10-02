@@ -1,0 +1,146 @@
+@import "tailwindcss";
+
+@theme {
+  /* System stack — no webfont round-trip. Swap for next/font if you want
+     Inter specifically; it renders nearly identically to -apple-system. */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+
+  /* Neutrals carry a faint green bias so they read as chosen against the
+     lime rather than as default grey. Kept under 4 units — enough to feel
+     related, not enough to look sickly. */
+  --color-ink-950: #080a07;
+  --color-ink-900: #0d100c;
+  --color-ink-850: #12150f;
+  --color-ink-800: #171b14;
+  --color-ink-700: #22271d;
+  /* Control borders in the composer. ink-700 disappears against a raised
+     field surface; ink-600 is too loud for every edge at once. */
+  --color-ink-650: #2a3024;
+  --color-ink-600: #333a2c;
+  --color-ink-400: #6c7364;
+  --color-ink-300: #9ba294;
+  --color-ink-200: #c9cfc4;
+
+  /* Acid lime. Very high luminance, so anything sitting ON it takes
+     accent-ink, never white — see the Generate button. */
+  --color-accent-500: #c6f82c;
+  --color-accent-400: #d8ff5e;
+  --color-accent-600: #a4d418;
+  --color-accent-ink: #0a0f02;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+/* Native controls follow the palette instead of fighting it. Without this an
+   unchecked checkbox renders as a white square and the select popup opens
+   white — both very loud against near-black. accent-color handles the
+   checked fill; color-scheme handles everything else the browser draws. */
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-ink-950);
+  color: var(--color-ink-200);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, unobtrusive scrollbars — the panels scroll a lot in this layout. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-700) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-ink-700);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Ambient hue drift, whole-page version.
+ *
+ * `position: fixed; inset: 0` — not a small absolutely-positioned blob near
+ * the hero — so the wash covers the full viewport and stays in place as the
+ * page scrolls past the feature cards and footer, the same way a room's
+ * ambient light tints everything in it rather than just one corner. It has
+ * no explicit z-index: every real section already carries `relative z-10`,
+ * so ordinary stacking keeps this behind them without needing a negative
+ * z-index (which risks disappearing behind an ancestor's own background in
+ * some browsers).
+ *
+ * v2: the first version (0.24 alpha, hue-rotate only, 40s) read as "too
+ * subtle" against the near-black background — a rotated hue at low alpha and
+ * low saturation over #080a07 barely moves the rendered pixel. Two changes
+ * fix that instead of just nudging alpha again: the keyframe now also swings
+ * saturate() up and down (so the colour itself intensifies mid-cycle, not
+ * just its hue), and the cycle is under 15s so the shift is visible within a
+ * few seconds of looking rather than only detectable across screenshots.
+ */
+@keyframes ambient-hue-drift {
+  0% {
+    filter: hue-rotate(0deg) saturate(1.4);
+  }
+  50% {
+    filter: hue-rotate(180deg) saturate(2.6);
+  }
+  100% {
+    filter: hue-rotate(360deg) saturate(1.4);
+  }
+}
+.ambient-glow {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 110% 75% at 50% 0%,
+    rgba(164, 212, 24, 0.5) 0%,
+    rgba(164, 212, 24, 0) 70%
+  );
+  animation: ambient-hue-drift 14s ease-in-out infinite;
+}
+
+/* Same drift, no positioning or background of its own — for the studio's
+   existing decorative glows (composer panel, gallery ground, edge light),
+   which already have their own size/placement and must stay scoped to their
+   own panel rather than covering the whole viewport like .ambient-glow. Never
+   put this on an element that has real content as a child — hue-rotate
+   would shift thumbnails and text too, not just the decorative wash. */
+.hue-drift {
+  animation: ambient-hue-drift 14s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ambient-glow,
+  .hue-drift {
+    animation: none;
+  }
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.05),
+    transparent
+  );
+  animation: shimmer 1.8s infinite;
+}
