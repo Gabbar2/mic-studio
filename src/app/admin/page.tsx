@@ -74,12 +74,20 @@ export default async function AdminUsersPage() {
   return (
     <main className="min-h-screen bg-ink-950 px-4 py-8 sm:px-8">
       <div className="mx-auto max-w-5xl">
-        <Link
-          href="/studio"
-          className="text-xs text-ink-400 transition hover:text-accent-400"
-        >
-          ← Mic Studio
-        </Link>
+        <div className="flex items-baseline justify-between">
+          <Link
+            href="/studio"
+            className="text-xs text-ink-400 transition hover:text-accent-400"
+          >
+            ← Mic Studio
+          </Link>
+          <Link
+            href="/admin/live"
+            className="text-xs text-ink-400 transition hover:text-accent-400"
+          >
+            Live chat →
+          </Link>
+        </div>
 
         <div className="mt-4 flex items-baseline justify-between gap-4">
           <h1 className="text-2xl font-semibold tracking-tight text-white">

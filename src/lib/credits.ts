@@ -58,6 +58,38 @@ export async function isUnlockedAccount(userId: string): Promise<boolean> {
 }
 
 /**
+ * Same test as `isUnlockedAccount`, batched across many users in two queries
+ * total instead of two queries per user. Built for the live visitor list,
+ * where N+1 would mean a growing number of round trips on every poll as
+ * more people are online at once, rather than for a single account page
+ * where the per-user version already reads fine.
+ */
+export async function bulkUnlockedUserIds(
+  userIds: string[],
+): Promise<Set<string>> {
+  if (!userIds.length) return new Set();
+
+  const admin = createAdminClient();
+  const [{ data: purchases }, { data: subs }] = await Promise.all([
+    admin
+      .from("credit_ledger")
+      .select("user_id")
+      .in("user_id", userIds)
+      .in("reason", ["purchase", "subscription"]),
+    admin.from("subscriptions").select("user_id").in("user_id", userIds),
+  ]);
+
+  const unlocked = new Set<string>();
+  for (const row of (purchases ?? []) as { user_id: string }[]) {
+    unlocked.add(row.user_id);
+  }
+  for (const row of (subs ?? []) as { user_id: string }[]) {
+    unlocked.add(row.user_id);
+  }
+  return unlocked;
+}
+
+/**
  * `markup` defaults to the global PRICE_MARKUP env var, same as before this
  * parameter existed. A caller that knows which model it's pricing should pass
  * `effectiveMarkup(model, priceMarkup())` instead, so a model with its own
