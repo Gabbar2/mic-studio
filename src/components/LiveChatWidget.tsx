@@ -42,6 +42,14 @@ export default function LiveChatWidget() {
   const { getToken, Widget } = useTurnstile();
   const anonInFlight = useRef<Promise<boolean> | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  // Tracks the most recent message id we've already accounted for, so a poll
+  // can tell "a reply just arrived" apart from "this is the same thread we
+  // already knew about". hasBaselineRef gates that comparison until the
+  // first fetch has actually run — without it, a visitor returning with old
+  // unread messages from a prior visit would have the panel yanked open the
+  // moment this component mounts, which is worse than the badge it replaces.
+  const latestMessageIdRef = useRef<string | null>(null);
+  const hasBaselineRef = useRef(false);
 
   const hasSession = useCallback(async () => {
     const supabase = createClient();
@@ -86,8 +94,27 @@ export default function LiveChatWidget() {
         );
         if (!res.ok) return;
         const data = await res.json();
-        setMessages(data.messages ?? []);
+        const list: ChatMessageRow[] = data.messages ?? [];
+        setMessages(list);
         setUnreadCount(data.unreadCount ?? 0);
+
+        const latest = list.length > 0 ? list[list.length - 1] : null;
+        if (hasBaselineRef.current) {
+          // A fresh admin message since the last time we checked — pop the
+          // panel open so a reply feels immediate rather than something the
+          // visitor has to notice a badge for and click themselves. Only
+          // fires for a reply that arrives while they're already here; see
+          // the ref's doc comment for why the very first fetch never does
+          // this on its own.
+          const isNewAdminReply =
+            !!latest &&
+            latest.sender === "admin" &&
+            latest.id !== latestMessageIdRef.current;
+          if (isNewAdminReply) setOpen(true);
+        } else {
+          hasBaselineRef.current = true;
+        }
+        latestMessageIdRef.current = latest?.id ?? latestMessageIdRef.current;
       } catch {
         // Transient — the next poll retries.
       }

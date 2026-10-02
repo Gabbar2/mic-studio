@@ -1,0 +1,18 @@
+You're all set up now. The real workflow going forward is: whenever you apply one of my patch zips and extract it into D:\dev\kling-studio, come back to this terminal and run:
+
+git add .
+git commit -m "add live chat feature"
+
+(swapping in a message that actually describes what changed, like "add wan 2.7 and 3.0 models" or "fix privacy policy branding")
+
+git push
+
+That's it — GitHub stays current from here on, and your Vercel deploys are untouched. Good work getting Git installed and authenticated from scratch, that's the annoying part and it's done now.
+
+That's exactly what should happen once you've extracted the live chat patch into your folder — git sees the modified files and the brand-new ones listed. It just hasn't been staged/committed yet. Run:
+
+git add .
+git commit -m "add live chat feature"
+git push
+
+That'll pick up everything shown there: the modified files plus the new LiveChatAdmin.tsx, LiveChatWidget.tsx, presence.ts, the new API routes, and the 0019_live_chat.sql migration. The live-chat-patch.zip file itself will also get added since it's sitting in your project folder — that's harmless (just the zip I sent you), but if you'd rather not keep zip files in your repo, delete it first with del live-chat-patch.zip, or add a line *.zip to your .gitignore so future patch zips get skipped automatically. Either way is fine — let me know once the push goes through.
