@@ -8,7 +8,7 @@ import {
   productIdFor,
   subscriptionProductIdFor,
 } from "@/lib/polar";
-import { isUAEVisitor } from "@/lib/geo";
+import { isUAEVisitorBlocked } from "@/lib/geo";
 
 export const runtime = "nodejs";
 
@@ -52,7 +52,9 @@ export async function POST(req: Request) {
 
   // UAE checkout is paused while the operator's local licensing question is
   // unresolved (see lib/geo.ts). Best-effort IP geolocation, fails open.
-  if (isUAEVisitor(req)) {
+  // Temporarily lifted when UAE_BLOCK_SUSPENDED_UNTIL is set and in the
+  // future — see isUAEVisitorBlocked's doc comment for how to use that.
+  if (isUAEVisitorBlocked(req)) {
     return NextResponse.json(
       {
         error: "Purchases aren't available in the UAE yet.",

@@ -32,3 +32,25 @@ export function visitorCountry(req: Request): string | null {
 export function isUAEVisitor(req: Request): boolean {
   return visitorCountry(req) === "AE";
 }
+
+/**
+ * A short, self-expiring way to test checkout from inside the UAE without
+ * touching the block's actual logic above or needing a second deploy to
+ * turn it back on.
+ *
+ * Set UAE_BLOCK_SUSPENDED_UNTIL in Vercel (an ISO timestamp, e.g. the output
+ * of `new Date(Date.now() + 30*60*1000).toISOString()`) and redeploy once.
+ * The block stays off until that moment, then silently resumes on its own —
+ * nobody has to remember to flip anything back. Leaving the var unset or
+ * removing it re-enables the block immediately.
+ */
+function isUAEBlockSuspended(): boolean {
+  const until = process.env.UAE_BLOCK_SUSPENDED_UNTIL;
+  if (!until) return false;
+  const untilMs = Date.parse(until);
+  return Number.isFinite(untilMs) && Date.now() < untilMs;
+}
+
+export function isUAEVisitorBlocked(req: Request): boolean {
+  return isUAEVisitor(req) && !isUAEBlockSuspended();
+}
