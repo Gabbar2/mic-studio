@@ -554,6 +554,11 @@ export default function Studio({
         <UpgradePrompt
           lock={upgradeLock}
           onClose={() => setUpgradeLock(null)}
+          creditCents={credit}
+          priceMarkup={priceMarkup}
+          modelId={value.modelId}
+          mode={value.mode}
+          withAudio={value.withAudio}
         />
       )}
     </div>
