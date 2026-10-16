@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import LiveChatWidget from "@/components/LiveChatWidget";
+import TawkToWidget from "@/components/TawkToWidget";
 
 export const metadata: Metadata = {
   title: "Mic - AI Video Generation",
@@ -17,8 +17,9 @@ export default function RootLayout({
         {children}
         {/* Mounted once, site-wide, so it follows a visitor across every
             page — it hides itself on /admin. See the component doc comment
-            for why it never creates a session on its own. */}
-        <LiveChatWidget />
+            for why replies now happen on tawk.to's own dashboard instead
+            of inside this app. */}
+        <TawkToWidget />
       </body>
     </html>
   );
