@@ -84,18 +84,11 @@ export default function PrivacyPage() {
             nothing else &mdash; never for analytics, profiling or advertising.
           </P>
           <P>
-            <B>Live chat messages.</B> If you message us through the chat
-            bubble, the messages and the reply are kept so the thread is
-            there if you come back. Sending a message, like generating a
-            clip, creates an account if you do not already have one.
-          </P>
-          <P>
-            <B>That you are here, right now.</B> While you have an active
-            session, the page you are on is refreshed every few seconds so
-            we can see who is currently using the site and reply quickly.
-            This is not a history of pages you have visited &mdash; only the
-            current one is kept, overwritten on the next page, and it is
-            used for support only.
+            <B>Live chat messages.</B> The chat bubble is provided by tawk.to,
+            a third party, rather than stored on our own servers. Messages
+            you send there are handled under tawk.to&apos;s own privacy
+            policy, not this one &mdash; no account on this app is created by
+            using it.
           </P>
           <P>
             <B>A session cookie.</B> One cookie, set to keep you signed in.
@@ -187,10 +180,9 @@ export default function PrivacyPage() {
             uploaded for them. You can delete one sooner at any time.
           </P>
           <P>
-            <B>Chat threads are kept for six months</B> too, then deleted the
-            same way. The &ldquo;currently here&rdquo; page you are on is not
-            kept at all beyond your own session &mdash; it is overwritten, never
-            logged.
+            <B>Chat messages</B> are retained by tawk.to under their own
+            retention policy, not ours, since the thread lives on their
+            servers rather than in this app&apos;s database.
           </P>
           <P>
             Your account and email address stay until you ask us to remove
