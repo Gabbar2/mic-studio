@@ -151,6 +151,46 @@ export default function Composer({
   const price = roundChargeCents(cost * effectiveMarkup(model, priceMarkup));
   const affordable = !billingEnabled || creditCents >= price;
 
+  /**
+   * What a specific (quality, duration[, mode]) combination would actually
+   * cost — same math as `price` above, just parameterized so the free tier's
+   * per-option locks below can check an option other than the one currently
+   * selected. Audio follows the current toggle, same as `cost` above.
+   */
+  const costForOption = (
+    quality: Quality,
+    durationSeconds: number,
+    mode: GenerationMode = value.mode,
+  ) =>
+    roundChargeCents(
+      estimateCostCents(
+        model,
+        mode,
+        quality,
+        durationSeconds,
+        value.withAudio && model.supportsAudio,
+      ) * effectiveMarkup(model, priceMarkup),
+    );
+
+  /**
+   * Whether the account's current balance alone covers a cost, independent
+   * of the free tier's static caps. `false` whenever billing isn't wired up
+   * (creditCents is undefined) — see the free-tier locks below, which fall
+   * back to the old FREE_QUALITY/FREE_DURATIONS/FREE_MODES-only behavior in
+   * that case, same as this component did before the balance-aware gating.
+   */
+  const canAfford = (cents: number) => billingEnabled && creditCents! >= cents;
+
+  /**
+   * A free-tier account with enough bought/bonus credit to cover a mode's
+   * cheapest shape should not be told to "upgrade" for something they can
+   * already pay for — a one-time pack purchase doesn't flip `tier` to
+   * `unlocked` by itself if nothing else about the account changed yet, so
+   * this is evaluated per-option rather than trusted to tier alone.
+   */
+  const cheapestDurationFor = (mode: GenerationMode) =>
+    durationsFor(model, mode, false)[0];
+
   const overLimit = value.prompt.length > model.maxPromptChars;
   const needsImage = value.mode === "image2video" && !value.imageUrl.trim();
   const needsReference =
@@ -239,25 +279,31 @@ export default function Composer({
           // Text-to-video is the whole trial. The free tier adds
           // image-to-video but still holds back reference-to-video — both
           // held back as the specific reasons to make an account or to
-          // upgrade, same as duration/quality/audio above.
+          // upgrade, unless the balance alone already covers that mode's
+          // cheapest shape (see costForOption/canAfford above).
           locked: isTrial
             ? m !== TRIAL_MODE
             : isFree
-              ? !FREE_MODES.includes(m)
+              ? !FREE_MODES.includes(m) &&
+                !canAfford(
+                  costForOption(FREE_QUALITY, cheapestDurationFor(m), m),
+                )
               : false,
         }))}
         value={value.mode}
         onLocked={(m) => onLocked?.(m === "image2video" ? "image2video" : "reference")}
         onChange={(v) => {
-          // Only a fully unlocked account reaches reference mode at all — the
-          // "credit floor" is the balance check at submit time, same as any
-          // other clip. This notice just gives the two benchmark numbers up
-          // front, since reference jobs cost more than the default Standard
-          // clip and "insufficient credit" after typing a whole prompt is a
-          // worse moment to learn that.
+          // Reached either by being fully unlocked, or — same as the lock
+          // above — by a free-tier balance that already covers reference
+          // mode's cheapest shape. Either way the "credit floor" is the
+          // balance check at submit time, same as any other clip; this
+          // notice just gives the two benchmark numbers up front, since
+          // reference jobs cost more than the default Standard clip and
+          // "insufficient credit" after typing a whole prompt is a worse
+          // moment to learn that.
           if (
             v === "reference2video" &&
-            tier === "unlocked" &&
+            tier !== "trial" &&
             (referenceProCents != null || referenceFourKCents != null)
           ) {
             setShowReferenceCreditNotice(true);
@@ -430,7 +476,8 @@ export default function Composer({
               locked: isTrial
                 ? d !== TRIAL_DURATION_SECONDS
                 : isFree
-                  ? !(FREE_DURATIONS as readonly number[]).includes(d)
+                  ? !(FREE_DURATIONS as readonly number[]).includes(d) &&
+                    !canAfford(costForOption(value.quality, d))
                   : false,
             }),
           )}
@@ -460,7 +507,8 @@ export default function Composer({
               locked: isTrial
                 ? q !== TRIAL_QUALITY
                 : isFree
-                  ? q !== FREE_QUALITY
+                  ? q !== FREE_QUALITY &&
+                    !canAfford(costForOption(q, value.durationSeconds))
                   : false,
             }))}
             value={value.quality}
