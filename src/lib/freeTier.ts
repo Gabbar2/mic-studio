@@ -29,12 +29,28 @@ export interface TierViolation {
  * free-tier account "insufficient credit" for something their balance would
  * otherwise cover is the wrong message. This runs only for signed-in accounts
  * that are neither anonymous nor unlocked (see credits.ts's isUnlockedAccount).
+ *
+ * `balance`, when passed, is the one escape hatch from the static caps below:
+ * a free-tier account that has bought a one-time pack is still `free` by
+ * `isUnlockedAccount`'s definition (that flag only flips on ever having
+ * paid, checked elsewhere), but it would be wrong to make them re-buy their
+ * way past a tier cap when the credit they already hold already covers this
+ * exact request. `balance.availableCents >= balance.requiredCents` skips
+ * every check below and returns null, same as a genuinely unlocked account —
+ * the real floor (can they actually afford it) is still enforced afterwards
+ * by the normal debit at generation time, same as everyone else.
  */
-export function checkFreeTierShape(input: {
-  mode: GenerationMode;
-  quality: Quality;
-  durationSeconds: number;
-}): TierViolation | null {
+export function checkFreeTierShape(
+  input: {
+    mode: GenerationMode;
+    quality: Quality;
+    durationSeconds: number;
+  },
+  balance?: { availableCents: number; requiredCents: number },
+): TierViolation | null {
+  if (balance && balance.availableCents >= balance.requiredCents) {
+    return null;
+  }
   if (!FREE_MODES.includes(input.mode)) {
     return {
       message:
