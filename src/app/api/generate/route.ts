@@ -7,6 +7,7 @@ import { checkTrialShape, trialBudgetSpent } from "@/lib/anon";
 import { checkFreeTierShape } from "@/lib/freeTier";
 import {
   chargeForProviderCost,
+  creditBalance,
   ensureSignupGrant,
   isUnlockedAccount,
   priceMarkup,
@@ -97,6 +98,25 @@ export async function POST(req: Request) {
     user.email ? { email: user.email } : undefined,
   );
 
+  // Computed up front (moved ahead of the free-tier check below) so a
+  // free-tier account whose balance already covers this exact request can be
+  // let through on that alone, rather than refused on shape for a request
+  // they can actually pay for. The real floor — can they afford it right
+  // now, this instant — is still enforced the normal way further down, by
+  // the debit itself; this is only about which account tiers may even try.
+  const providerCents = estimateCostCents(
+    model,
+    input.mode,
+    input.quality,
+    input.durationSeconds,
+    input.withAudio && model.supportsAudio,
+    !!input.referenceVideoUrl,
+  );
+  const chargedCents = chargeForProviderCost(
+    providerCents,
+    effectiveMarkup(model, priceMarkup()),
+  );
+
   // --- the free clip / the free tier's caps --------------------------------
   // Refuse on shape before the mode-specific checks below, so a trial visitor
   // who picked Pro — or a signed-up-but-unpaid account reaching for Reference
@@ -117,11 +137,15 @@ export async function POST(req: Request) {
       );
     }
   } else if (!unlocked) {
-    const violation = checkFreeTierShape({
-      mode: input.mode,
-      quality: input.quality,
-      durationSeconds: input.durationSeconds,
-    });
+    const availableCents = await creditBalance(user.id);
+    const violation = checkFreeTierShape(
+      {
+        mode: input.mode,
+        quality: input.quality,
+        durationSeconds: input.durationSeconds,
+      },
+      { availableCents, requiredCents: chargedCents },
+    );
     if (violation) {
       return NextResponse.json(
         { error: violation.message, code: "tier_locked", lock: violation.lock },
@@ -203,18 +227,8 @@ export async function POST(req: Request) {
     );
   }
 
-  const providerCents = estimateCostCents(
-    model,
-    input.mode,
-    input.quality,
-    input.durationSeconds,
-    input.withAudio && model.supportsAudio,
-    !!input.referenceVideoUrl,
-  );
-  const chargedCents = chargeForProviderCost(
-    providerCents,
-    effectiveMarkup(model, priceMarkup()),
-  );
+  // providerCents/chargedCents are computed above, ahead of the free-tier
+  // check — nothing to redo here.
 
   // --- the daily trial budget ---------------------------------------------
   // This is the control that actually holds. Cookies, IP addresses and device
