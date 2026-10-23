@@ -195,6 +195,18 @@ export default function PrivacyPage() {
             provider&apos;s storage and those links expire. Download anything
             you want to keep.
           </P>
+          <P>
+            <B>Early-cleanup notices.</B> Separately from the six-month
+            schedule above, we may at our discretion select a specific group
+            of accounts for an earlier cleanup &mdash; for example to reclaim
+            storage from accounts that are no longer active. If yours is
+            selected, we email the address on file with a deadline and links
+            to the clips on that account, and that account&apos;s stored
+            clips are deleted after the stated deadline. This never happens
+            without that email being sent first, and never shortens the
+            six-month window for any account that isn&apos;t specifically
+            selected this way.
+          </P>
         </Section>
 
         <Section title="Your choices">
