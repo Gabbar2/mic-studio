@@ -1,19 +1,9 @@
 import Link from "next/link";
 import { requireAdmin } from "@/lib/admin";
-import { creditLabel } from "@/lib/pricing";
+import UsersTable from "@/components/admin/UsersTable";
+import RetentionCleanupPanel from "@/components/admin/RetentionCleanupPanel";
 
 export const dynamic = "force-dynamic";
-
-function fmt(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleString("en-US", {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 /**
  * Every account, one row each — email, activity, and how many clips they've
@@ -102,77 +92,11 @@ export default async function AdminUsersPage() {
           </span>
         </div>
 
-        <div className="mt-6 overflow-x-auto rounded-xl border border-ink-800">
-          <table className="w-full min-w-[720px] border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-ink-800 bg-ink-900/60">
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Email
-                </th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Joined
-                </th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Last seen
-                </th>
-                <th className="px-3 py-2.5 text-center text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Confirmed
-                </th>
-                <th className="px-3 py-2.5 text-right text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Clips
-                </th>
-                <th className="px-3 py-2.5 text-right text-[11px] font-medium uppercase tracking-wide text-ink-400">
-                  Credits
-                </th>
-                <th className="px-3 py-2.5" />
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr
-                  key={r.id}
-                  className="border-b border-ink-800/70 last:border-0 hover:bg-ink-900/40"
-                >
-                  <td className="px-3 py-2.5 text-ink-200">
-                    {r.email}
-                    {r.isAdmin && (
-                      <span className="ml-2 rounded border border-accent-500/40 bg-accent-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-400">
-                        Admin
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2.5 text-ink-400">
-                    {fmt(r.joinedAt)}
-                  </td>
-                  <td className="px-3 py-2.5 text-ink-400">
-                    {fmt(r.lastSeenAt)}
-                  </td>
-                  <td className="px-3 py-2.5 text-center">
-                    {r.confirmed ? (
-                      <span className="text-accent-400">✓</span>
-                    ) : (
-                      <span className="text-ink-600">—</span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums text-ink-200">
-                    {r.clips}
-                  </td>
-                  <td className="px-3 py-2.5 text-right tabular-nums text-ink-200">
-                    {creditLabel(r.creditsLeftCents)}
-                  </td>
-                  <td className="px-3 py-2.5 text-right">
-                    <Link
-                      href={`/admin/users/${r.id}`}
-                      className="text-xs text-accent-400 underline underline-offset-2 transition hover:text-white"
-                    >
-                      View clips
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="mt-6">
+          <UsersTable rows={rows} />
         </div>
+
+        <RetentionCleanupPanel />
       </div>
     </main>
   );
