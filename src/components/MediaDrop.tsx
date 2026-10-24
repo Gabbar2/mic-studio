@@ -5,6 +5,27 @@ import { ACCEPT, uploadMedia, type MediaKind } from "@/lib/upload";
 import { useUploadConsent } from "./UploadConsent";
 
 /**
+ * Reads a video URL's own duration in the browser, via a throwaway <video>
+ * element rather than any upload/parsing step — the same trick the preview
+ * thumbnail above already relies on (`preload="metadata"`), just read
+ * programmatically instead of displayed. Works for a Supabase Storage URL
+ * (range requests are supported) as well as a freshly uploaded one. Used
+ * only to drive this app's own reference-video pricing (see
+ * `ModelDef.referenceVideoBilling` in lib/models.ts) — never sent to the
+ * provider itself.
+ */
+function probeVideoDuration(src: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.muted = true;
+    v.onloadedmetadata = () => resolve(v.duration);
+    v.onerror = () => reject(new Error("Could not read video duration"));
+    v.src = src;
+  });
+}
+
+/**
  * A single media slot: click to browse, drag a file in, or paste (a file from
  * the clipboard, or a URL as text). Uploads to Supabase Storage and hands the
  * parent back a public URL the provider can fetch.
@@ -19,6 +40,7 @@ export default function MediaDrop({
   compact,
   disabled,
   disabledHint,
+  onDurationChange,
 }: {
   label?: string;
   hint?: string;
@@ -37,6 +59,14 @@ export default function MediaDrop({
   disabled?: boolean;
   /** Shown in place of `hint` while `disabled` and empty. */
   disabledHint?: string;
+  /**
+   * Reports the clip's own duration (seconds) whenever `value` changes, for
+   * `kind === "video"` only — fires with 0 once the slot is cleared. Omit for
+   * any video slot that doesn't drive pricing (Kling's flat-rate reference
+   * video, start/end frames); only Wan 3.0's additive-billing reference video
+   * passes this today.
+   */
+  onDurationChange?: (seconds: number) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -107,6 +137,33 @@ export default function MediaDrop({
     // during render was hiding.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [granted, disabled]);
+
+  // Re-probes on every value change rather than only right after `handle()`
+  // uploads a file — that single effect also covers a pasted URL (which
+  // never goes through `handle`) and the slot being cleared (reports 0),
+  // without duplicating the probe call at each of those sites.
+  useEffect(() => {
+    if (kind !== "video" || !onDurationChange) return;
+    if (!value) {
+      onDurationChange(0);
+      return;
+    }
+    let cancelled = false;
+    probeVideoDuration(value)
+      .then((seconds) => {
+        if (!cancelled) onDurationChange(seconds);
+      })
+      .catch(() => {
+        // Left for the server's own fallback (see the generate route) rather
+        // than guessed at here — reporting 0 would read as "no reference
+        // video" to the pricing math, which is the wrong direction to fail
+        // toward for a bill that only ever goes up from an unmeasured video.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, kind]);
 
   return (
     <div ref={rootRef} tabIndex={-1} className="outline-none">
