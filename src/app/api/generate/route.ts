@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+4import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -23,6 +23,16 @@ import {
   imageReferenceBudget,
 } from "@/lib/models";
 
+/**
+ * Fallback used only when a reference video is attached to an
+ * additive-billing model (Wan 3.0) but the client didn't report a duration —
+ * stale/old client code, or the probe in MediaDrop failing silently. Rather
+ * than charge 0 extra seconds (undercharging relative to what fal actually
+ * bills — exactly the risk this whole feature exists to avoid), this assumes
+ * the worst case the model allows, so the business is never short.
+ */
+const UNREPORTED_REFERENCE_VIDEO_DURATION_SECONDS = 15;
+
 export const runtime = "nodejs";
 
 const Body = z.object({
@@ -42,6 +52,18 @@ const Body = z.object({
   // enforced below via imageReferenceBudget(model), once the model is known.
   // This is just an outer sanity bound against the largest any model offers.
   referenceImageUrls: z.array(z.string().url()).max(10).optional(),
+  /**
+   * The reference video's own length, measured client-side (see MediaDrop's
+   * duration probe). Only read for a model billed "additive" — see the
+   * clamp below. This is client-reported, not independently re-measured from
+   * the file here, so a user who edits the request by hand could under-report
+   * it to shave a little off an additive-billing job's price; the clamp below
+   * bounds how much that's worth (at most the model's own
+   * maxReferenceVideoUploadSeconds), and the "missing" fallback charges the
+   * worst case rather than zero, so neither path can badly undercharge
+   * relative to what fal actually bills.
+   */
+  referenceVideoDurationSeconds: z.number().min(0).max(60).optional(),
 });
 
 export async function POST(req: Request) {
@@ -98,6 +120,26 @@ export async function POST(req: Request) {
     user.email ? { email: user.email } : undefined,
   );
 
+  // Only meaningful for a model billed "additive" (Wan 3.0 today) — see
+  // ModelDef.referenceVideoBilling. Clamped to the model's own upload cap (15s
+  // for Wan 3.0) rather than trusted verbatim, and a missing/zero value when a
+  // video IS attached falls back to that same cap rather than 0 seconds — the
+  // safe direction to be wrong in is overcharging a few hundred credits, not
+  // under-billing a request fal will bill for real. See the Body schema
+  // comment above for the fuller reasoning.
+  const referenceVideoDurationSeconds =
+    input.mode === "reference2video" &&
+    input.referenceVideoUrl &&
+    model.referenceVideoBilling === "additive"
+      ? Math.min(
+          input.referenceVideoDurationSeconds ||
+            model.maxReferenceVideoUploadSeconds ||
+            UNREPORTED_REFERENCE_VIDEO_DURATION_SECONDS,
+          model.maxReferenceVideoUploadSeconds ??
+            UNREPORTED_REFERENCE_VIDEO_DURATION_SECONDS,
+        )
+      : 0;
+
   // Computed up front (moved ahead of the free-tier check below) so a
   // free-tier account whose balance already covers this exact request can be
   // let through on that alone, rather than refused on shape for a request
@@ -111,6 +153,7 @@ export async function POST(req: Request) {
     input.durationSeconds,
     input.withAudio && model.supportsAudio,
     !!input.referenceVideoUrl,
+    referenceVideoDurationSeconds,
   );
   const chargedCents = chargeForProviderCost(
     providerCents,
@@ -336,6 +379,7 @@ export async function POST(req: Request) {
       imageUrl: input.imageUrl,
       endImageUrl: input.endImageUrl,
       referenceVideoUrl: input.referenceVideoUrl,
+      referenceVideoDurationSeconds,
       referenceImageUrls: referenceImages,
       callbackUrl: process.env.PROVIDER_CALLBACK_URL || undefined,
       externalTaskId: gen.id,
