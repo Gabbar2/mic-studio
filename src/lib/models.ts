@@ -80,6 +80,34 @@ export interface ModelDef {
    * for the video-reference case specifically.
    */
   maxReferenceDurationSeconds?: number;
+  /**
+   * How a reference *video* gets billed, for a model with
+   * `supportsReferenceVideo: true`. Two shapes exist on fal, and they are not
+   * interchangeable:
+   *   - "flat" (the default, and Kling's O1 video-to-video endpoint): one
+   *     flat per-second rate (`referenceVideoRate`) times the OUTPUT
+   *     duration only. The reference video's own length never enters the
+   *     bill.
+   *   - "additive" (Wan 3.0's omni-reference endpoint, confirmed by live
+   *     billing-event tests on fal's dashboard rather than trusted from fal's
+   *     own pricing copy, which understates it): the model's normal
+   *     per-resolution rate times (output duration + the uploaded reference
+   *     video's own duration). A 5s output with a 7s reference video bills
+   *     as 12 seconds, not 5.
+   * Omit for a model that doesn't support a reference video at all, or that
+   * uses the flat/Kling shape.
+   */
+  referenceVideoBilling?: "flat" | "additive";
+  /**
+   * The longest a single uploaded reference *video* may run, for a model
+   * billed "additive" above — separate from `maxReferenceDurationSeconds`
+   * (which caps the OUTPUT duration), this caps the length of the file
+   * itself, since that length is what gets added to the bill. fal's own
+   * omni-reference docs describe up to 5 reference videos sharing a 15s
+   * combined budget; this app only ever attaches one, so the single video's
+   * cap is the same 15s.
+   */
+  maxReferenceVideoUploadSeconds?: number;
 }
 
 const V3: Record<Quality, Rate> = {
@@ -285,15 +313,24 @@ export const WAN_2_7: ModelDef = {
  * undercuts Kling's std, and pro lands at the same credit price as Kling's
  * pro despite being the newest model with native audio.
  *
- * Reference-to-video is supported, images only — same reasoning as Wan 2.7:
- * fal's `alibaba/wan-3.0/reference-to-video` also takes `reference_video_urls`
- * alongside `reference_image_urls`, and this app has no verified, bounded way
- * to price a request that includes one, so only images are ever sent
- * (`supportsReferenceVideo` stays unset/false). fal documents up to 10
- * reference images for this endpoint — see `maxReferences` below. Billed at
- * this model's normal per-resolution rate, same as text/image-to-video; no
- * duration cap narrower than the rest of the model is documented, so the
- * usual 5/10/15s range carries over unchanged.
+ * Reference-to-video takes both images and a reference video here, unlike
+ * Wan 2.7: `alibaba/wan-3.0/reference-to-video` is fal's richer
+ * "omni-reference" endpoint, documenting up to 10 reference images and up to
+ * 5 reference videos (15s combined). This app only ever attaches one of
+ * each — one image slot budget (`maxReferences`, 10) and one video slot
+ * (`maxReferenceVideoUploadSeconds`, 15).
+ *
+ * The reason Wan 2.7 stays images-only while Wan 3.0 forwards the video is
+ * pricing, not capability — fal bills a video reference here by ADDING its
+ * own duration to the output duration (`referenceVideoBilling: "additive"`
+ * below), a flat-rate-per-second formula confirmed empirically against
+ * fal's own billing-event dashboard (several real test generations, varying
+ * reference-video length, cross-checked against the Quantity/Total Cost
+ * columns fal records per request) rather than trusted from fal's pricing
+ * page, which only describes the output-duration case. Wan 2.7's reference
+ * endpoint bills the same "input and output duration combined" way per its
+ * own doc comment above, with no equivalent verification done for it yet —
+ * that's the actual reason it's still excluded, not a capability gap.
  */
 const WAN_3_0_RATES: Record<Quality, Rate> = {
   std: { silent: 5.0, withAudio: 5.0 },
@@ -327,6 +364,9 @@ export const WAN_3_0: ModelDef = {
   maxReferences: 10,
   priceMarkupOverride: 2.0,
   qualityResolution: { std: "480p", pro: "720p" },
+  supportsReferenceVideo: true,
+  referenceVideoBilling: "additive",
+  maxReferenceVideoUploadSeconds: 15,
 };
 
 export const MODELS: ModelDef[] = [KLING_V3, WAN_2_2, WAN_2_7, WAN_3_0];
@@ -382,7 +422,14 @@ export function qualitiesFor(
  * case uses the shared `REFERENCE_VIDEO_MAX_DURATION_SECONDS`, while a
  * model's own `maxReferenceDurationSeconds` (Wan 2.7's reference endpoint
  * tops out at 10s regardless of whether a video is attached, since this app
- * never attaches one for Wan at all) applies independently of that.
+ * never attaches one for Wan 2.7) applies independently of that.
+ *
+ * The flat 10s cap only applies when a video reference also means the "flat"
+ * billing/endpoint shape (Kling's O1, a genuinely different endpoint with its
+ * own narrower duration enum). Wan 3.0's video reference stays on its normal
+ * reference-to-video endpoint and bills additively instead — nothing about
+ * attaching a video there narrows its own duration options, so a model with
+ * `referenceVideoBilling: "additive"` skips this particular cap.
  */
 export function durationsFor(
   model: ModelDef,
@@ -391,8 +438,11 @@ export function durationsFor(
 ): number[] {
   if (mode !== "reference2video") return model.durations;
 
+  const appliesFlatVideoCap =
+    hasReferenceVideo && model.referenceVideoBilling !== "additive";
+
   const cap = Math.min(
-    hasReferenceVideo ? REFERENCE_VIDEO_MAX_DURATION_SECONDS : Infinity,
+    appliesFlatVideoCap ? REFERENCE_VIDEO_MAX_DURATION_SECONDS : Infinity,
     model.maxReferenceDurationSeconds ?? Infinity,
   );
   return Number.isFinite(cap)
@@ -417,7 +467,26 @@ export function estimateCostCents(
   durationSeconds: number,
   withAudio: boolean,
   hasReferenceVideo = false,
+  /**
+   * The uploaded reference video's own length, in seconds — only read for a
+   * model billed "additive" (see `ModelDef.referenceVideoBilling`). Ignored
+   * otherwise, so every existing call site that never passes this keeps
+   * pricing exactly as before.
+   */
+  referenceVideoDurationSeconds = 0,
 ): number {
+  if (
+    mode === "reference2video" &&
+    hasReferenceVideo &&
+    model.referenceVideoBilling === "additive"
+  ) {
+    const rate = model.priceCentsPerSecond[mode][quality];
+    const billedSeconds = durationSeconds + referenceVideoDurationSeconds;
+    return Math.round(
+      (withAudio ? rate.withAudio : rate.silent) * billedSeconds,
+    );
+  }
+
   const rate =
     mode === "reference2video" && hasReferenceVideo
       ? model.referenceVideoRate
