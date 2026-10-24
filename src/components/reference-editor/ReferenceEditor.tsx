@@ -203,6 +203,12 @@ function ReferenceEditorInner() {
       setJobs(newJobs);
       setStage("ready");
     } catch (e) {
+      // Logged in full, not just whatever string ends up on screen — some
+      // failures here (a Worker 'error' event, say) reject with something
+      // that isn't a standard Error, so the banner falls back to a generic
+      // message and this is the only place the real shape of what was
+      // thrown is visible at all.
+      console.error("[reference-editor] prepare failed:", e);
       setError(e instanceof Error ? e.message : "Could not prepare the clip.");
       setStage("loaded");
     }
