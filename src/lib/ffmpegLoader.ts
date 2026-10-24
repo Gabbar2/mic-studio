@@ -32,9 +32,21 @@
 
 const FFMPEG_VERSION = "0.12.10";
 
-const WORKER_URL = "/api/ffmpeg/worker.js";
-const CORE_URL = "/api/ffmpeg/core.js";
-const WASM_URL = "/api/ffmpeg/core.wasm";
+/** Resolves one of this app's own `/api/ffmpeg/*` paths against the page's
+ * own origin, as a full `https://…` URL rather than a relative one.
+ *
+ * This matters more than it looks like it should: `new Worker(url)` resolves
+ * a relative `url` against the *calling module's own* location, not the
+ * page's — and the ffmpeg.wasm library that calls `new Worker(classWorkerURL)`
+ * is itself a module loaded from jsdelivr. A relative "/api/ffmpeg/worker.js"
+ * therefore resolved to jsdelivr's own origin ("https://cdn.jsdelivr.net/api/…",
+ * a path that doesn't exist there) instead of this site's — confirmed by the
+ * exact wording of the resulting "Failed to construct 'Worker'" error.
+ * Building the absolute URL here, against `window.location.origin`, sidesteps
+ * that resolution entirely. */
+function sameOriginUrl(path: string): string {
+  return new URL(path, window.location.origin).toString();
+}
 
 // Minimal structural type for the pieces of the FFmpeg instance this app
 // actually calls — the real class has a much larger surface area, and
@@ -125,9 +137,9 @@ export async function loadFfmpeg(
     ffmpeg.on("log", (e) => console.log("[ffmpeg]", e.message));
     console.log("[ffmpeg] calling ffmpeg.load()…");
     await ffmpeg.load({
-      coreURL: CORE_URL,
-      wasmURL: WASM_URL,
-      classWorkerURL: WORKER_URL,
+      coreURL: sameOriginUrl("/api/ffmpeg/core.js"),
+      wasmURL: sameOriginUrl("/api/ffmpeg/core.wasm"),
+      classWorkerURL: sameOriginUrl("/api/ffmpeg/worker.js"),
     });
     console.log("[ffmpeg] load() resolved — engine ready.");
     return ffmpeg;
