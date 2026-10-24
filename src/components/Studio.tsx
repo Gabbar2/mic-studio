@@ -147,6 +147,7 @@ export default function Studio({
     endImageUrl: "",
     referenceVideoUrl: "",
     referenceImageUrls: [],
+    referenceVideoDurationSeconds: 0,
   });
 
   // Upscales are polled through the same endpoint, so a running upscale has to
@@ -325,6 +326,10 @@ export default function Studio({
           referenceVideoUrl:
             value.mode === "reference2video" && value.referenceVideoUrl
               ? value.referenceVideoUrl
+              : undefined,
+          referenceVideoDurationSeconds:
+            value.mode === "reference2video" && value.referenceVideoUrl
+              ? value.referenceVideoDurationSeconds
               : undefined,
           referenceImageUrls:
             value.mode === "reference2video"
@@ -524,6 +529,11 @@ export default function Studio({
                 imageUrl: g.source_image_url ?? "",
                 endImageUrl: g.end_image_url ?? "",
                 referenceVideoUrl: g.reference_video_url ?? "",
+                // Not carried over from the reused clip — ReferencePanel's
+                // MediaDrop re-probes the video URL as soon as it mounts
+                // with this value, which corrects it a moment later; this
+                // is just the safe starting point until then.
+                referenceVideoDurationSeconds: 0,
                 referenceImageUrls: g.reference_image_urls ?? [],
                 aspectRatio: g.aspect_ratio,
                 durationSeconds: g.duration_seconds,
