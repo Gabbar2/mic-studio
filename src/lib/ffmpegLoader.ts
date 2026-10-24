@@ -10,8 +10,9 @@
  * a large generated file that is effectively impossible to hand-edit
  * correctly through a web UI, and a mismatched lockfile fails the Vercel
  * build outright (`npm ci` refuses to proceed). Loading the library from a
- * CDN as a native browser ES module sidesteps all of that: this file and its
- * caller are the only things that need to exist in the repo.
+ * CDN as a native browser ES module sidesteps all of that: this file, its
+ * caller, and the small proxy route at `src/app/api/ffmpeg/[...path]/route.ts`
+ * are the only things that need to exist in the repo.
  *
  * Also deliberately the single-threaded core (`@ffmpeg/core`, not
  * `@ffmpeg/core-mt`) — the multi-threaded core needs the page to be
@@ -19,20 +20,21 @@
  * embeds third-party iframes/scripts (Cloudflare Turnstile, the tawk.to chat
  * widget) that cross-origin isolation can break. Single-threaded is slower
  * but needs no header changes anywhere else in the app.
+ *
+ * The worker script and the wasm core are loaded through this app's own
+ * `/api/ffmpeg/*` proxy route rather than straight from jsdelivr — see that
+ * route's own doc comment for why: in short, a Worker can't be constructed
+ * from a cross-origin script URL at all, and routing around that with a
+ * blob: URL caused the worker to silently never request its own core/wasm
+ * files once running. Making everything same-origin avoids both problems at
+ * once.
  */
 
 const FFMPEG_VERSION = "0.12.10";
-const CORE_VERSION = "0.12.10";
-const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
-// @ffmpeg/ffmpeg spawns a background Worker from this exact script, and
-// browsers refuse to construct a Worker from a cross-origin URL at all —
-// jsdelivr's permissive CORS headers don't help here, since that's a
-// fetch-time allowance and this is a same-origin check on the Worker
-// constructor itself. Fetched and turned into a same-origin blob: URL below
-// (the only one of the three load() URLs that needs this — see the comment
-// by `classWorkerURL` in loadFfmpeg for why the other two stay as plain CDN
-// URLs instead).
-const WORKER_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm/worker.js`;
+
+const WORKER_URL = "/api/ffmpeg/worker.js";
+const CORE_URL = "/api/ffmpeg/core.js";
+const WASM_URL = "/api/ffmpeg/core.wasm";
 
 // Minimal structural type for the pieces of the FFmpeg instance this app
 // actually calls — the real class has a much larger surface area, and
@@ -60,22 +62,14 @@ declare global {
 
 let loadPromise: Promise<FfmpegInstance> | null = null;
 
-/** Fetches a CDN URL and hands back a same-origin blob: URL for it — ffmpeg's
- * own loader needs this rather than the raw cross-origin URL, since a worker
- * can't be constructed from a cross-origin script URL directly. */
-async function toBlobURL(url: string, mimeType: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Could not fetch ${url} (${res.status})`);
-  }
-  const buf = await res.arrayBuffer();
-  return URL.createObjectURL(new Blob([buf], { type: mimeType }));
-}
-
 /** Injects a `<script type="module">` that imports the CDN build and stashes
  * the `FFmpeg` constructor on `window` — the only reliable way to pull in a
  * package Next's bundler has never heard of without it trying (and failing)
- * to resolve the import at build time. */
+ * to resolve the import at build time. This one import is a plain ES module
+ * import statement in the main page thread, not a Worker construction, so
+ * it was never subject to the same-origin restriction that forced the
+ * worker/core/wasm files onto this app's own `/api/ffmpeg/*` proxy below —
+ * loading it straight from jsdelivr is fine as-is. */
 function injectFfmpegModule(): Promise<void> {
   return new Promise((resolve, reject) => {
     if (window.__micFfmpegCtor) {
@@ -129,21 +123,12 @@ export async function loadFfmpeg(
     // enough to report. Harmless in production; nobody but someone with
     // DevTools open ever sees it.
     ffmpeg.on("log", (e) => console.log("[ffmpeg]", e.message));
-    console.log("[ffmpeg] fetching the worker script…");
-    const classWorkerURL = await toBlobURL(WORKER_URL, "text/javascript");
-    // coreURL/wasmURL are deliberately NOT blobbed, unlike the worker script
-    // above. They're fetched by the WORKER itself once it starts (not by this
-    // page), and a worker can `fetch()` an ordinary cross-origin URL under
-    // normal CORS rules just fine — jsdelivr already serves the permissive
-    // headers that allows. What a worker can't reliably do is resolve a
-    // blob: URL that a *different* global (this page) created; that mismatch
-    // is what silently hung load() here on the first attempt, with no error
-    // on either side to point at it. Only the Worker constructor itself needs
-    // same-origin, which is the one thing classWorkerURL above exists to fix.
-    const coreURL = `${CORE_BASE}/ffmpeg-core.js`;
-    const wasmURL = `${CORE_BASE}/ffmpeg-core.wasm`;
     console.log("[ffmpeg] calling ffmpeg.load()…");
-    await ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
+    await ffmpeg.load({
+      coreURL: CORE_URL,
+      wasmURL: WASM_URL,
+      classWorkerURL: WORKER_URL,
+    });
     console.log("[ffmpeg] load() resolved — engine ready.");
     return ffmpeg;
   })();
