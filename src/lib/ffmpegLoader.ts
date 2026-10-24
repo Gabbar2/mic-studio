@@ -80,6 +80,8 @@ export interface FfmpegInstance {
   exec(args: string[]): Promise<number>;
   on(event: "progress", cb: (e: { progress: number }) => void): void;
   on(event: "log", cb: (e: { message: string }) => void): void;
+  off(event: "progress", cb: (e: { progress: number }) => void): void;
+  off(event: "log", cb: (e: { message: string }) => void): void;
 }
 
 declare global {
