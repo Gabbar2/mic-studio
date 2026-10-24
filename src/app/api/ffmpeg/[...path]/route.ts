@@ -1,6 +1,17 @@
 /**
- * Same-origin proxy for the three ffmpeg.wasm files the Reference Editor's
- * client-side trimming needs (worker.js, ffmpeg-core.js, ffmpeg-core.wasm).
+ * Same-origin proxy for the ffmpeg.wasm files the Reference Editor's
+ * client-side trimming needs: worker.js, ffmpeg-core.js, ffmpeg-core.wasm,
+ * and — this is the part that isn't obvious up front — every sibling module
+ * worker.js itself imports (errors.js, const.js, and whatever else the
+ * package's dist/esm build splits out). It is NOT one self-contained file;
+ * it's a small tree of ES modules that import each other by relative path,
+ * and those relative imports resolve against wherever worker.js is actually
+ * served from — this route — not against jsdelivr's own folder. So every
+ * sibling file needs the same proxying treatment as worker.js, not just
+ * worker.js by name; the generic `*.js` branch below exists for exactly
+ * that, rather than listing each filename out by hand (the dependency list
+ * isn't published anywhere stable to hand-copy from, and a future ffmpeg.wasm
+ * patch version could add or rename one).
  *
  * This exists to get rid of cross-origin entirely, not just work around it.
  * Loading these straight from jsdelivr ran into two separate browser
@@ -10,7 +21,7 @@
  * blob: URL to dodge that then caused the worker to silently never request
  * its own core/wasm files once running — no error on either side, just a
  * permanent hang (confirmed in DevTools: zero network requests for those
- * files ever appeared). Serving all three from this app's own origin avoids
+ * files ever appeared). Serving everything from this app's own origin avoids
  * both problems at once — nothing is cross-origin or blob: anymore, so
  * there's no special-case behavior left to trip over.
  *
@@ -27,11 +38,8 @@ export const runtime = "edge";
 const FFMPEG_VERSION = "0.12.10";
 const CORE_VERSION = "0.12.10";
 
-const SOURCES: Record<string, string> = {
-  "worker.js": `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm/worker.js`,
-  "core.js": `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd/ffmpeg-core.js`,
-  "core.wasm": `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd/ffmpeg-core.wasm`,
-};
+const FFMPEG_ESM_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm`;
+const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
 
 export async function GET(
   _req: Request,
@@ -39,7 +47,22 @@ export async function GET(
 ) {
   const { path } = await context.params;
   const file = path.join("/");
-  const upstream = SOURCES[file];
+
+  // Reject path traversal / empty segments before building any upstream
+  // URL from them — this route forwards whatever filename it's asked for,
+  // so it has to be the one checking that itself.
+  const safe = path.every((seg) => seg.length > 0 && seg !== "." && seg !== "..");
+
+  let upstream: string | null = null;
+  if (safe && file === "core.js") {
+    upstream = `${CORE_BASE}/ffmpeg-core.js`;
+  } else if (safe && file === "core.wasm") {
+    upstream = `${CORE_BASE}/ffmpeg-core.wasm`;
+  } else if (safe && /\.js$/.test(file)) {
+    // worker.js itself, plus every sibling module it imports by relative
+    // path (errors.js, const.js, …) — see the top-of-file comment.
+    upstream = `${FFMPEG_ESM_BASE}/${file}`;
+  }
 
   if (!upstream) {
     return new Response("Not found", { status: 404 });
