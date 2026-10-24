@@ -94,3 +94,60 @@ export function planSegments(
       i === count - 1 ? endSeconds : startSeconds + (i + 1) * chunkLength,
   }));
 }
+
+/**
+ * Turns detected scene-cut timestamps (from `sceneDetect.ts`) into final clip
+ * boundaries. Three steps: split [startSeconds, endSeconds] at every cut;
+ * drop boundaries that land implausibly close together (detection can fire
+ * twice for one real cut, or once a frame or two early) by merging the
+ * segment that would result into its neighbor rather than producing a
+ * near-zero-length clip nobody wants; then, for any segment still longer
+ * than the model's own duration cap, fall back to the existing even-split
+ * logic (`planSegments`) so nothing sent onward exceeds what the model
+ * actually accepts. With no detected cuts at all, this degrades to exactly
+ * one segment covering the whole selection, cap-split the same way the
+ * editor already behaved before scene detection existed.
+ */
+export function planScenesFromCuts(
+  cutTimes: number[],
+  startSeconds: number,
+  endSeconds: number,
+  capSeconds: number,
+  minSegmentSeconds = 0.6,
+): { start: number; end: number }[] {
+  if (endSeconds <= startSeconds) return [];
+
+  const candidates = [startSeconds, ...cutTimes, endSeconds].filter(
+    (t) => t > startSeconds - 0.001 && t < endSeconds + 0.001,
+  );
+  candidates.sort((a, b) => a - b);
+
+  const boundaries: number[] = [candidates[0]];
+  for (let i = 1; i < candidates.length; i++) {
+    if (candidates[i] - boundaries[boundaries.length - 1] >= minSegmentSeconds) {
+      boundaries.push(candidates[i]);
+    }
+  }
+  // The true end point can itself get merged away above, if the last real
+  // cut landed within `minSegmentSeconds` of it — always keep it as the
+  // final boundary rather than silently losing the tail of the selection.
+  if (boundaries[boundaries.length - 1] !== endSeconds) {
+    if (boundaries.length > 1) {
+      boundaries[boundaries.length - 1] = endSeconds;
+    } else {
+      boundaries.push(endSeconds);
+    }
+  }
+
+  const segments: { start: number; end: number }[] = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const segStart = boundaries[i];
+    const segEnd = boundaries[i + 1];
+    if (capSeconds > 0 && segEnd - segStart > capSeconds) {
+      segments.push(...planSegments(segStart, segEnd, capSeconds));
+    } else {
+      segments.push({ start: segStart, end: segEnd });
+    }
+  }
+  return segments;
+}
