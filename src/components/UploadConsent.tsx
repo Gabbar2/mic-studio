@@ -20,11 +20,27 @@ import { CONSENT_HINT, CONSENT_TEXT } from "@/lib/consent";
 interface ConsentValue {
   granted: boolean;
   setGranted: (v: boolean) => void;
+  /**
+   * The id of whichever MediaDrop slot is mid-upload, or null when nothing
+   * is uploading. Shared across every slot inside one UploadConsentProvider
+   * — start/end frame, the video reference, and every image reference slot
+   * — so only one upload can run at a time per model, not just per slot.
+   * Applies the same way to every model: this lives above ReferencePanel's
+   * per-model branching, so Kling's four reference images, Wan 3.0's ten,
+   * and the video dropzone any of them might show are all one shared lock.
+   * MediaDrop claims it in `handle()` and releases it when the upload
+   * settles; every other slot reads it to disable its own empty state in
+   * the meantime (see MediaDrop's `effectiveDisabled`).
+   */
+  busyKey: string | null;
+  setBusyKey: (key: string | null) => void;
 }
 
 const Ctx = createContext<ConsentValue>({
   granted: false,
   setGranted: () => {},
+  busyKey: null,
+  setBusyKey: () => {},
 });
 
 export function UploadConsentProvider({
@@ -33,7 +49,12 @@ export function UploadConsentProvider({
   children: React.ReactNode;
 }) {
   const [granted, setGranted] = useState(false);
-  return <Ctx.Provider value={{ granted, setGranted }}>{children}</Ctx.Provider>;
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  return (
+    <Ctx.Provider value={{ granted, setGranted, busyKey, setBusyKey }}>
+      {children}
+    </Ctx.Provider>
+  );
 }
 
 export function useUploadConsent() {
