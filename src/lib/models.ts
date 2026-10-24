@@ -505,3 +505,19 @@ export function estimateCostCents(
 export function imageReferenceBudget(model: ModelDef): number {
   return model.maxReferences;
 }
+
+/**
+ * The longest a single uploaded reference *video* may run for this model, or
+ * 0 if it doesn't take one at all. One place to read this rather than
+ * inlining the Kling-vs-Wan-3.0 fallback at every call site (the Reference
+ * Editor's trim timeline and Composer/ReferencePanel's own hint text both
+ * need this same number): Kling's flat-billing O1 endpoint uses the shared
+ * `REFERENCE_VIDEO_MAX_DURATION_SECONDS`, Wan 3.0's additive-billing endpoint
+ * uses its own `maxReferenceVideoUploadSeconds`.
+ */
+export function referenceVideoCapSeconds(model: ModelDef): number {
+  if (!model.supportsReferenceVideo) return 0;
+  return (
+    model.maxReferenceVideoUploadSeconds ?? REFERENCE_VIDEO_MAX_DURATION_SECONDS
+  );
+}
