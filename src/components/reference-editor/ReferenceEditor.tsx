@@ -9,6 +9,7 @@ import ConsentCheckbox, {
 } from "@/components/UploadConsent";
 import { uploadMedia } from "@/lib/upload";
 import { extractClip, planSegments } from "@/lib/videoClip";
+import { loadFfmpeg } from "@/lib/ffmpegLoader";
 import {
   writeReferenceTransfer,
   type ReferenceTransferJob,
@@ -144,6 +145,16 @@ function ReferenceEditorInner() {
             }
             return res.blob();
           })();
+
+      // Loaded explicitly, up front, and labeled on its own — a ~30 MB
+      // engine download the first time it's used is a different kind of
+      // wait than the encode that follows, and showing one spinner for both
+      // made a slow-but-fine download look like a stuck encode (see the
+      // console logs this now also prints — open DevTools if this step ever
+      // needs diagnosing again). Already cached after the first clip, so
+      // this resolves instantly for every segment after the first.
+      setPrepareLabel("Loading the trimming engine (first time only)…");
+      await loadFfmpeg();
 
       const segments = planSegments(range.start, range.end, capSeconds || Infinity);
       const aspectRatio = guessAspectRatio(meta.width, meta.height);
