@@ -32,6 +32,20 @@
 
 const FFMPEG_VERSION = "0.12.10";
 
+// Bumped by hand whenever the `/api/ffmpeg/*` route's behavior changes (which
+// upstream file it proxies, for instance) — NOT tied to FFMPEG_VERSION,
+// which only changes when the library itself is upgraded. The route sends
+// these files back with a year-long `immutable` cache header (reasonable:
+// each one is tens of MB and never changes on its own), which means a
+// browser that already fetched the old content under this exact URL will
+// go on reusing it forever otherwise, even after the route starts serving
+// something different — that's exactly what happened the first time this
+// route's upstream changed, and cost a long detour to track down. Folding
+// this into the URL turns a route change into a new URL instead, which a
+// cache miss on naturally, with no reliance on the person doing a hard
+// refresh or clearing site data by hand.
+const CACHE_BUST = "r2";
+
 /** Resolves one of this app's own `/api/ffmpeg/*` paths against the page's
  * own origin, as a full `https://…` URL rather than a relative one.
  *
@@ -45,7 +59,9 @@ const FFMPEG_VERSION = "0.12.10";
  * Building the absolute URL here, against `window.location.origin`, sidesteps
  * that resolution entirely. */
 function sameOriginUrl(path: string): string {
-  return new URL(path, window.location.origin).toString();
+  const url = new URL(path, window.location.origin);
+  url.searchParams.set("v", CACHE_BUST);
+  return url.toString();
 }
 
 // Minimal structural type for the pieces of the FFmpeg instance this app
