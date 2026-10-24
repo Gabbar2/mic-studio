@@ -8,7 +8,9 @@ import ConsentCheckbox, {
   useUploadConsent,
 } from "@/components/UploadConsent";
 import { uploadMedia } from "@/lib/upload";
-import { extractClip, planSegments } from "@/lib/videoClip";
+import { extractClip, planScenesFromCuts } from "@/lib/videoClip";
+import { detectSceneCuts } from "@/lib/sceneDetect";
+import { captureThumbnail } from "@/lib/videoThumbnail";
 import { loadFfmpeg } from "@/lib/ffmpegLoader";
 import {
   writeReferenceTransfer,
@@ -49,6 +51,13 @@ function guessAspectRatio(width: number, height: number): AspectRatio {
 
 type Stage = "empty" | "loaded" | "preparing" | "ready";
 
+interface PreparedClip {
+  job: ReferenceTransferJob;
+  start: number;
+  end: number;
+  thumbnail: string | null;
+}
+
 export default function ReferenceEditor() {
   return (
     <UploadConsentProvider>
@@ -79,14 +88,21 @@ function ReferenceEditorInner() {
   const [error, setError] = useState<string | null>(null);
   const [prepareLabel, setPrepareLabel] = useState("");
   const [prepareProgress, setPrepareProgress] = useState(0);
-  const [jobs, setJobs] = useState<ReferenceTransferJob[]>([]);
+  const [clips, setClips] = useState<PreparedClip[]>([]);
+  // Which prepared scene clips are checked to go on to Studio — keyed by
+  // job id rather than index, so it survives clips being added one at a
+  // time as detection/trimming works through the list. Absence of a key
+  // means "included": a clip is on by default the moment it appears, with
+  // no flash of being unchecked first.
+  const [included, setIncluded] = useState<Record<string, boolean>>({});
 
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
 
   const loadSource = useCallback((file: File | null, remoteUrl: string) => {
     setError(null);
-    setJobs([]);
+    setClips([]);
+    setIncluded({});
     setStage("empty");
     setSourceFile(file);
 
@@ -127,6 +143,8 @@ function ReferenceEditorInner() {
 
     setStage("preparing");
     setError(null);
+    setClips([]);
+    setIncluded({});
 
     try {
       // Remote URLs need their actual bytes for ffmpeg — a local File
@@ -156,15 +174,34 @@ function ReferenceEditorInner() {
       setPrepareLabel("Loading the trimming engine (first time only)…");
       await loadFfmpeg();
 
-      const segments = planSegments(range.start, range.end, capSeconds || Infinity);
+      // Scene detection runs on the already-selected range only, not the
+      // whole upload — the person drew that range on purpose, and scanning
+      // past it would both waste time and could pull in cuts they deliberately
+      // trimmed away.
+      setPrepareLabel("Finding scenes in your selection…");
+      setPrepareProgress(0);
+      const cuts = await detectSceneCuts(
+        sourceBlob,
+        range.start,
+        range.end,
+        0.35,
+        setPrepareProgress,
+      );
+
+      const segments = planScenesFromCuts(
+        cuts,
+        range.start,
+        range.end,
+        capSeconds || Infinity,
+      );
       const aspectRatio = guessAspectRatio(meta.width, meta.height);
-      const newJobs: ReferenceTransferJob[] = [];
+      const newClips: PreparedClip[] = [];
 
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         setPrepareLabel(
           segments.length > 1
-            ? `Trimming clip ${i + 1} of ${segments.length}…`
+            ? `Trimming scene ${i + 1} of ${segments.length}…`
             : "Trimming your clip…",
         );
         setPrepareProgress(0);
@@ -178,7 +215,7 @@ function ReferenceEditorInner() {
 
         setPrepareLabel(
           segments.length > 1
-            ? `Uploading clip ${i + 1} of ${segments.length}…`
+            ? `Uploading scene ${i + 1} of ${segments.length}…`
             : "Uploading your clip…",
         );
         jobSeq.current += 1;
@@ -189,7 +226,7 @@ function ReferenceEditorInner() {
         );
         const url = await uploadMedia(file, "video", granted);
 
-        newJobs.push({
+        const job: ReferenceTransferJob = {
           id: `job-${jobSeq.current}`,
           modelId: model.id,
           referenceVideoUrl: url,
@@ -197,10 +234,24 @@ function ReferenceEditorInner() {
           referenceImageUrls: [],
           prompt: "",
           aspectRatio,
-        });
+        };
+
+        // Best-effort — a missing thumbnail just renders an empty tile
+        // rather than failing the whole prepare flow (see videoThumbnail.ts).
+        const thumbnail = await captureThumbnail(
+          sourceUrl,
+          (seg.start + seg.end) / 2,
+        );
+
+        newClips.push({ job, start: seg.start, end: seg.end, thumbnail });
+        // Shown as each one finishes rather than all at once at the end —
+        // there can now be several scenes, and watching them land one by
+        // one is a better signal of real progress than a single spinner
+        // that doesn't move until the whole batch is done.
+        setClips([...newClips]);
+        setIncluded((prev) => ({ ...prev, [job.id]: true }));
       }
 
-      setJobs(newJobs);
       setStage("ready");
     } catch (e) {
       // Logged in full, not just whatever string ends up on screen — some
@@ -214,8 +265,13 @@ function ReferenceEditorInner() {
     }
   }
 
+  const selectedJobs = clips
+    .filter((c) => included[c.job.id] !== false)
+    .map((c) => c.job);
+
   function continueInStudio() {
-    writeReferenceTransfer(jobs);
+    if (selectedJobs.length === 0) return;
+    writeReferenceTransfer(selectedJobs);
     router.push("/studio");
   }
 
@@ -312,7 +368,8 @@ function ReferenceEditorInner() {
                 setSourceFile(null);
                 setSourceUrl("");
                 setMeta(null);
-                setJobs([]);
+                setClips([]);
+                setIncluded({});
               }}
               className="ml-auto text-accent-400 underline underline-offset-2 hover:text-white"
             >
@@ -391,10 +448,11 @@ function ReferenceEditorInner() {
                 : "Prepare clip(s)"}
             </button>
             <p className="text-center text-[11px] text-ink-400">
-              This trims and re-encodes your clip right here in the browser —
-              no file leaves your device until it&apos;s uploaded as the
-              finished reference clip. The first clip may take a little
-              longer while the trimming engine itself downloads.
+              This finds scene cuts inside your selection, trims each one
+              into its own reference clip, right here in the browser — no
+              file leaves your device until each clip is uploaded. The first
+              clip may take a little longer while the trimming engine itself
+              downloads.
             </p>
           </div>
         </div>
@@ -406,59 +464,126 @@ function ReferenceEditorInner() {
         </p>
       )}
 
-      {/* --- Prepared jobs + transfer -------------------------------------- */}
-      {stage === "ready" && jobs.length > 0 && (
-        <div className="space-y-3 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
-          <h2 className="text-sm font-semibold text-white">
-            {jobs.length === 1
-              ? "Clip ready"
-              : `${jobs.length} clips ready — one generation job each`}
-          </h2>
-          <ul className="space-y-1.5">
-            {jobs.map((j, i) => (
-              <li
-                key={j.id}
-                className="flex items-center justify-between rounded-lg border border-ink-650 bg-ink-850 px-3 py-2 text-xs text-ink-200"
-              >
-                <span>
-                  Clip {i + 1} of {jobs.length} —{" "}
-                  {j.referenceVideoDurationSeconds.toFixed(1)}s
-                </span>
-                <a
-                  href={j.referenceVideoUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-accent-400 underline underline-offset-2 hover:text-white"
-                >
-                  Preview ↗
-                </a>
-              </li>
-            ))}
-          </ul>
-          <button
-            type="button"
-            onClick={continueInStudio}
-            className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400"
-          >
-            Continue in Mic Studio →
-          </button>
-          <p className="text-center text-[11px] text-ink-400">
-            Opens Studio with {model?.label} and {jobs.length === 1 ? "this clip" : "the first clip"}{" "}
-            already loaded into Reference mode. Nothing generates and no
-            credit is spent until you review it there and press Generate
-            yourself.
-          </p>
-        </div>
-      )}
+      {/* --- Detected scenes + transfer -------------------------------------- */}
+      {(stage === "ready" || (stage === "preparing" && clips.length > 0)) &&
+        clips.length > 0 && (
+          <div className="space-y-3 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-white">
+                {clips.length === 1
+                  ? "Clip ready"
+                  : `${clips.length} scene${clips.length === 1 ? "" : "s"} found — ${selectedJobs.length} selected`}
+              </h2>
+              {clips.length > 1 && (
+                <div className="flex shrink-0 gap-2 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setIncluded(
+                        Object.fromEntries(clips.map((c) => [c.job.id, true])),
+                      )
+                    }
+                    className="text-accent-400 underline underline-offset-2 hover:text-white"
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setIncluded(
+                        Object.fromEntries(clips.map((c) => [c.job.id, false])),
+                      )
+                    }
+                    className="text-accent-400 underline underline-offset-2 hover:text-white"
+                  >
+                    None
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {clips.map((c, i) => {
+                const isIncluded = included[c.job.id] !== false;
+                return (
+                  <label
+                    key={c.job.id}
+                    className={`relative block cursor-pointer overflow-hidden rounded-lg border transition ${
+                      isIncluded
+                        ? "border-accent-400"
+                        : "border-ink-650 opacity-50"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={isIncluded}
+                      onChange={(e) =>
+                        setIncluded((prev) => ({
+                          ...prev,
+                          [c.job.id]: e.target.checked,
+                        }))
+                      }
+                      className="absolute right-1.5 top-1.5 z-10 h-4 w-4 accent-accent-500"
+                    />
+                    {c.thumbnail ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={c.thumbnail}
+                        alt=""
+                        className="aspect-video w-full object-cover"
+                      />
+                    ) : (
+                      <div className="flex aspect-video w-full items-center justify-center bg-ink-900 text-[10px] text-ink-500">
+                        No preview
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between bg-ink-850 px-2 py-1 text-[10px] text-ink-300">
+                      <span>
+                        Scene {i + 1} ·{" "}
+                        {c.job.referenceVideoDurationSeconds.toFixed(1)}s
+                      </span>
+                      <a
+                        href={c.job.referenceVideoUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-accent-400 underline underline-offset-2 hover:text-white"
+                      >
+                        ↗
+                      </a>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+
+            <button
+              type="button"
+              onClick={continueInStudio}
+              disabled={stage !== "ready" || selectedJobs.length === 0}
+              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
+            >
+              Continue in Mic Studio →
+            </button>
+            <p className="text-center text-[11px] text-ink-400">
+              Opens Studio with {model?.label} and{" "}
+              {selectedJobs.length === 1
+                ? "the selected clip"
+                : "the first selected clip"}{" "}
+              already loaded into Reference mode. Nothing generates and no
+              credit is spent until you review it there and press Generate
+              yourself.
+            </p>
+          </div>
+        )}
 
       {/* --- Coming next ----------------------------------------------- */}
       <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
         <span className="font-medium text-ink-200">Coming next:</span>{" "}
-        automatic scene detection, hover-to-select objects/backgrounds with
-        real AI segmentation, and ChatGPT-drafted editing prompts per
-        element. For now, prepare your trimmed reference clip above and
-        write your prompt and attach any reference images once you land in
-        Mic Studio.
+        hover-to-select objects/backgrounds with real AI segmentation, and
+        ChatGPT-drafted editing prompts per element. For now, review the
+        detected scenes above, drop any you don&apos;t want, and write your
+        prompt and attach any reference images once you land in Mic Studio.
       </div>
     </div>
   );
