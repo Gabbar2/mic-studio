@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ACCEPT, uploadMedia, type MediaKind } from "@/lib/upload";
 import { useUploadConsent } from "./UploadConsent";
 
@@ -73,7 +73,24 @@ export default function MediaDrop({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  const { granted } = useUploadConsent();
+  const { granted, busyKey, setBusyKey } = useUploadConsent();
+
+  // One id per slot instance, stable for the component's lifetime — used to
+  // tell "I'm the one uploading" apart from "some other slot is uploading"
+  // via the shared busyKey (see UploadConsent.tsx). Two different slots never
+  // collide on this even if they render in the same position across a
+  // re-render, which a plain counter or the slot's own label could.
+  const id = useId();
+  const lockedByOtherUpload = busyKey !== null && busyKey !== id;
+  // Every place below that used to gate on the parent's `disabled` prop alone
+  // now also respects another slot being mid-upload — same reasoning as the
+  // parent gate (click/drag/paste become no-ops on an empty slot), just a
+  // second reason rather than a new mechanism. Keeps every model's composer
+  // down to one upload in flight at a time: start/end frame, the reference
+  // video, and every reference image slot (4 for Kling and Wan 2.7, 10 for
+  // Wan 3.0) all share the one busyKey from the UploadConsentProvider they
+  // sit inside.
+  const effectiveDisabled = disabled || lockedByOtherUpload;
 
   const height = compact ? "h-20" : "h-28";
 
@@ -82,7 +99,7 @@ export default function MediaDrop({
     // (the parent simply never renders a usable end-frame slot's onChange
     // path without a start frame in practice), but told here so nothing
     // appears to accept a file it will not use.
-    if (disabled) return;
+    if (effectiveDisabled) return;
 
     // Checked here as well as on the server. Not for security — the server is
     // the only thing that actually enforces it — but so the person is told
@@ -93,6 +110,9 @@ export default function MediaDrop({
     }
 
     setBusy(true);
+    // Claimed for the whole upload, released in `finally` below regardless of
+    // outcome — a failed upload must not leave every other slot locked.
+    setBusyKey(id);
     setError(null);
     try {
       onChange(await uploadMedia(file, kind, granted));
@@ -100,6 +120,7 @@ export default function MediaDrop({
       setError(e instanceof Error ? e.message : "Upload failed");
     } finally {
       setBusy(false);
+      setBusyKey(null);
     }
   }
 
@@ -108,7 +129,7 @@ export default function MediaDrop({
     if (!el) return;
 
     const onPaste = (e: ClipboardEvent) => {
-      if (disabled) return;
+      if (effectiveDisabled) return;
 
       const file = Array.from(e.clipboardData?.files ?? [])[0];
       if (file) {
@@ -131,12 +152,12 @@ export default function MediaDrop({
 
     el.addEventListener("paste", onPaste);
     return () => el.removeEventListener("paste", onPaste);
-    // Rebinds when consent or the disabled gate changes. The listener closes
-    // over both, so a stale binding would keep accepting (or refusing)
-    // pastes after either one flipped — which is exactly the bug a ref read
-    // during render was hiding.
+    // Rebinds when consent or either disabled reason changes. The listener
+    // closes over all three, so a stale binding would keep accepting (or
+    // refusing) pastes after one of them flipped — which is exactly the bug
+    // a ref read during render was hiding.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [granted, disabled]);
+  }, [granted, effectiveDisabled]);
 
   // Re-probes on every value change rather than only right after `handle()`
   // uploads a file — that single effect also covers a pasted URL (which
@@ -222,31 +243,31 @@ export default function MediaDrop({
         <button
           type="button"
           onClick={() => {
-            if (disabled) return;
+            if (effectiveDisabled) return;
             inputRef.current?.click();
           }}
           onDragOver={(e) => {
-            if (disabled) return;
+            if (effectiveDisabled) return;
             e.preventDefault();
             setDragging(true);
           }}
           onDragLeave={() => setDragging(false)}
           onDrop={(e) => {
             e.preventDefault();
-            if (disabled) return;
+            if (effectiveDisabled) return;
             setDragging(false);
             const file = e.dataTransfer.files?.[0];
             if (file) void handle(file);
           }}
-          disabled={busy || disabled}
-          aria-disabled={!granted || disabled}
+          disabled={busy || effectiveDisabled}
+          aria-disabled={!granted || effectiveDisabled}
           className={`flex ${height} w-full flex-col items-center justify-center gap-1 rounded-lg border border-dashed transition ${
             dragging
               ? "border-accent-400 bg-accent-500/20"
-              : disabled || !granted
+              : effectiveDisabled || !granted
                 ? "border-ink-650 bg-ink-850 opacity-45"
                 : "border-accent-500/35 bg-ink-850 hover:border-accent-500/70 hover:bg-accent-500/[0.07]"
-          } ${disabled ? "cursor-not-allowed" : ""}`}
+          } ${effectiveDisabled ? "cursor-not-allowed" : ""}`}
         >
           {busy ? (
             <>
@@ -256,6 +277,10 @@ export default function MediaDrop({
           ) : disabled ? (
             <span className="px-2 text-center text-[11px] text-ink-400">
               {disabledHint ?? "Add a start frame first"}
+            </span>
+          ) : lockedByOtherUpload ? (
+            <span className="px-2 text-center text-[11px] text-ink-400">
+              Finish the current upload first
             </span>
           ) : (
             <>
@@ -275,7 +300,7 @@ export default function MediaDrop({
         ref={inputRef}
         type="file"
         accept={ACCEPT[kind]}
-        disabled={disabled}
+        disabled={effectiveDisabled}
         className="hidden"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -285,7 +310,7 @@ export default function MediaDrop({
       />
 
       {error && <p className="mt-1.5 text-[11px] text-red-400">{error}</p>}
-      {!error && hint && !(disabled && !value) && (
+      {!error && hint && !(effectiveDisabled && !value) && (
         <p className="mt-1.5 text-[11px] text-ink-400">{hint}</p>
       )}
     </div>
