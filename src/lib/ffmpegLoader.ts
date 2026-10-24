@@ -112,7 +112,9 @@ export async function loadFfmpeg(
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
+    console.log("[ffmpeg] loading the ES module from jsdelivr…");
     await injectFfmpegModule();
+    console.log("[ffmpeg] module loaded, constructing instance…");
     const Ctor = window.__micFfmpegCtor;
     if (!Ctor) {
       throw new Error("Video-trimming library did not load correctly.");
@@ -121,12 +123,22 @@ export async function loadFfmpeg(
     if (onProgress) {
       ffmpeg.on("progress", (e) => onProgress(Math.min(1, Math.max(0, e.progress))));
     }
+    // ffmpeg's own stderr, line by line, prefixed so it's easy to spot in
+    // DevTools — the only way to tell "slow but working" apart from "stuck"
+    // from outside, since a long single-threaded encode can sit at 0%
+    // progress for a while before the library's own progress parser has
+    // enough to report. Harmless in production; nobody but someone with
+    // DevTools open ever sees it.
+    ffmpeg.on("log", (e) => console.log("[ffmpeg]", e.message));
+    console.log("[ffmpeg] fetching core.js, core.wasm and the worker script…");
     const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
       toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
       toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
       toBlobURL(WORKER_URL, "text/javascript"),
     ]);
+    console.log("[ffmpeg] all three fetched, calling ffmpeg.load()…");
     await ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
+    console.log("[ffmpeg] load() resolved — engine ready.");
     return ffmpeg;
   })();
 
