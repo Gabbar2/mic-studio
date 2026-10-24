@@ -24,13 +24,27 @@
 const FFMPEG_VERSION = "0.12.10";
 const CORE_VERSION = "0.12.10";
 const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
+// The piece that actually broke on first deploy: @ffmpeg/ffmpeg spawns a
+// background Worker from this exact script, and browsers refuse to
+// construct a Worker from a cross-origin URL at all — jsdelivr's permissive
+// CORS headers don't help here, since that's a fetch-time allowance and this
+// is a same-origin check on the Worker constructor itself. Fetching it and
+// handing ffmpeg a blob: URL instead (via `classWorkerURL` in `.load()`
+// below) is the same fix already applied to the core/wasm files above, just
+// for the one piece that actually surfaced as a browser error rather than
+// failing quietly.
+const WORKER_URL = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm/worker.js`;
 
 // Minimal structural type for the pieces of the FFmpeg instance this app
 // actually calls — the real class has a much larger surface area, and
 // loading it from a CDN string import means TypeScript can't see its real
 // declaration file anyway.
 export interface FfmpegInstance {
-  load(opts: { coreURL: string; wasmURL: string }): Promise<void>;
+  load(opts: {
+    coreURL: string;
+    wasmURL: string;
+    classWorkerURL: string;
+  }): Promise<void>;
   writeFile(name: string, data: Uint8Array): Promise<void>;
   readFile(name: string): Promise<Uint8Array>;
   deleteFile(name: string): Promise<void>;
@@ -107,11 +121,12 @@ export async function loadFfmpeg(
     if (onProgress) {
       ffmpeg.on("progress", (e) => onProgress(Math.min(1, Math.max(0, e.progress))));
     }
-    const [coreURL, wasmURL] = await Promise.all([
+    const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
       toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
       toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+      toBlobURL(WORKER_URL, "text/javascript"),
     ]);
-    await ffmpeg.load({ coreURL, wasmURL });
+    await ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
     return ffmpeg;
   })();
 
