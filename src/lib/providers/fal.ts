@@ -18,9 +18,13 @@
  *     top-level namespace (not under fal-ai/wan). Docs:
  *     https://fal.ai/models/alibaba/wan-3.0/text-to-video/api
  *
- * Wan 2.7 and Wan 3.0 also run reference-to-video (`.../reference-to-video`),
- * images only — see `rejectReferenceVideo` and the ModelDef doc comments in
- * lib/models.ts for why a reference *video* isn't forwarded for either.
+ * Wan 2.7 and Wan 3.0 both run reference-to-video (`.../reference-to-video`).
+ * Wan 2.7 stays images-only — see `rejectReferenceVideo` and the ModelDef
+ * doc comments in lib/models.ts for why. Wan 3.0's endpoint is the richer
+ * "omni-reference" shape and also takes a reference *video*
+ * (`reference_video_urls`), forwarded in `createWan30` below and billed
+ * additively (output duration + the video's own duration) — see
+ * `ModelDef.referenceVideoBilling` in lib/models.ts.
  */
 
 import { ProviderError } from "./types";
@@ -186,13 +190,16 @@ function wan27EndpointFor(mode: GenerationMode): string {
 }
 
 /**
- * Rejects a reference-video upload for a Wan model's reference-to-video call.
- * The UI never offers the video dropzone for these models (see
- * `ModelDef.supportsReferenceVideo` in lib/models.ts — it's unset for every
- * Wan model), so this should be unreachable; it exists as a backstop in case
- * stale client state ever sends one anyway, rather than silently billing a
- * request this app can't price (fal combines input + output duration for a
- * video reference, which isn't accounted for in `estimateCostCents`).
+ * Rejects a reference-video upload for a Wan reference-to-video call that
+ * doesn't support one — Wan 2.7 only, now that Wan 3.0 forwards its own (see
+ * `createWan30` below). The UI never offers the video dropzone for Wan 2.7
+ * (see `ModelDef.supportsReferenceVideo` in lib/models.ts — it's unset for
+ * it), so this should be unreachable; it exists as a backstop in case stale
+ * client state ever sends one anyway, rather than silently billing a request
+ * this app can't price (fal combines input + output duration for a video
+ * reference there too, per its own doc comment in lib/models.ts, and that
+ * combination has not been verified against fal's actual billing for Wan 2.7
+ * the way it has been for Wan 3.0).
  */
 function rejectReferenceVideo(p: CreateVideoParams, model: string): void {
   if (p.referenceVideoUrl) {
@@ -283,6 +290,15 @@ function wan30EndpointFor(mode: GenerationMode): string {
  * forwarded here, including in reference mode (its reference endpoint takes
  * the same `audio` flag). It also doesn't accept `negative_prompt` at all
  * (not in its schema), so that field is never sent.
+ *
+ * Reference mode here is fal's "omni-reference" shape: `reference_image_urls`
+ * for images (field name confirmed working in production already) and
+ * `reference_video_urls` for a reference video, both arrays, sent alongside
+ * each other when both are present. Only one video is ever attached in this
+ * app (the composer offers a single video dropzone), so it's always a
+ * one-element array when sent at all. Unlike Wan 2.7, no `rejectReferenceVideo`
+ * call here — a reference video is expected and priced for (see
+ * `estimateCostCents` in lib/models.ts), not a defensive-backstop case.
  */
 async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
   const body: Record<string, unknown> = {
@@ -298,8 +314,18 @@ async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
     }
     body.image_url = p.imageUrl;
   } else if (p.mode === "reference2video") {
-    rejectReferenceVideo(p, "Wan 3.0");
-    body.reference_image_urls = p.referenceImageUrls;
+    if (!p.referenceImageUrls?.length && !p.referenceVideoUrl) {
+      throw new ProviderError(
+        "Reference mode needs at least one reference image or a reference video.",
+        "fal",
+      );
+    }
+    if (p.referenceImageUrls?.length) {
+      body.reference_image_urls = p.referenceImageUrls;
+    }
+    if (p.referenceVideoUrl) {
+      body.reference_video_urls = [p.referenceVideoUrl];
+    }
     body.aspect_ratio = p.aspectRatio;
   } else {
     body.aspect_ratio = p.aspectRatio;

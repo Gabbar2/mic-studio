@@ -23,6 +23,13 @@ export interface CreateVideoParams {
   referenceImageUrls?: string[];
   /** A video whose motion and style the generation follows (@Element1). */
   referenceVideoUrl?: string;
+  /**
+   * The reference video's own duration in seconds, client-measured and
+   * server-validated — only meaningful for a model billed "additive" (see
+   * `ModelDef.referenceVideoBilling`). Not sent to fal itself; this is for
+   * this app's own pricing only, since fal reads the real file.
+   */
+  referenceVideoDurationSeconds?: number;
   callbackUrl?: string;
   /** Our generations.id, echoed back by providers that support it. */
   externalTaskId?: string;
