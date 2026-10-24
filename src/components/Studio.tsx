@@ -22,6 +22,11 @@ import {
 import type { AccountTier } from "@/lib/freeTier";
 import { setSessionEnsurer } from "@/lib/upload";
 import { DEFAULT_MODEL_ID, MODELS } from "@/lib/models";
+import {
+  advanceReferenceTransferCursor,
+  clearReferenceTransfer,
+  readReferenceTransfer,
+} from "@/lib/referenceTransfer";
 import type { Generation } from "@/lib/types";
 import type { Spend } from "@/lib/format";
 import type { UpscaleTarget } from "@/lib/upscale";
@@ -149,6 +154,77 @@ export default function Studio({
     referenceImageUrls: [],
     referenceVideoDurationSeconds: 0,
   });
+
+  /**
+   * The hand-off from /reference-editor (see lib/referenceTransfer.ts). Read
+   * once on mount — sessionStorage doesn't exist during the server render,
+   * so this has to happen client-side, after the composer's own default
+   * state above has already settled. When present, each job's reference
+   * video/images/prompt/model overwrite whatever was in the composer; the
+   * person reviews and edits from there like any other clip, and nothing
+   * generates until they press the composer's own Generate button.
+   */
+  const [transfer, setTransfer] = useState<ReturnType<
+    typeof readReferenceTransfer
+  > | null>(null);
+
+  useEffect(() => {
+    const incoming = readReferenceTransfer();
+    if (!incoming) return;
+    // One-time sync from an external store (sessionStorage) read on mount —
+    // same pattern and same justified exception as RetentionCleanupPanel's
+    // own fetch-on-mount effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTransfer(incoming);
+    applyTransferJob(incoming.jobs[incoming.cursor]);
+    // Runs once on mount only — a later change to `value` (the person
+    // editing the prefilled prompt, say) must not be stomped by re-applying
+    // the same job again.
+  }, []);
+
+  function applyTransferJob(job: {
+    modelId: string;
+    referenceVideoUrl: string;
+    referenceVideoDurationSeconds: number;
+    referenceImageUrls: string[];
+    prompt: string;
+    aspectRatio: "16:9" | "9:16" | "1:1";
+  }) {
+    const jobModel = MODELS.find((m) => m.id === job.modelId);
+    setValue((v) => ({
+      ...v,
+      modelId: job.modelId,
+      mode: "reference2video",
+      quality: v.quality === "4k" ? "pro" : v.quality,
+      prompt: job.prompt || v.prompt,
+      aspectRatio: job.aspectRatio,
+      referenceVideoUrl: jobModel?.supportsReferenceVideo
+        ? job.referenceVideoUrl
+        : "",
+      referenceVideoDurationSeconds: jobModel?.supportsReferenceVideo
+        ? job.referenceVideoDurationSeconds
+        : 0,
+      referenceImageUrls: job.referenceImageUrls,
+    }));
+  }
+
+  function nextTransferJob() {
+    if (!transfer) return;
+    const nextCursor = transfer.cursor + 1;
+    if (nextCursor >= transfer.jobs.length) {
+      clearReferenceTransfer();
+      setTransfer(null);
+      return;
+    }
+    advanceReferenceTransferCursor(nextCursor);
+    setTransfer({ jobs: transfer.jobs, cursor: nextCursor });
+    applyTransferJob(transfer.jobs[nextCursor]);
+  }
+
+  function dismissTransfer() {
+    clearReferenceTransfer();
+    setTransfer(null);
+  }
 
   // Upscales are polled through the same endpoint, so a running upscale has to
   // keep the poll alive too — otherwise it finishes and the UI never notices.
@@ -444,6 +520,37 @@ export default function Studio({
                 "radial-gradient(120% 40% at 50% 100%, rgba(164,212,24,0.34), transparent 75%)",
             }}
           />
+
+          {transfer && (
+            <div className="relative z-10 mb-3 flex items-start justify-between gap-3 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2.5">
+              <p className="text-[11px] leading-relaxed text-ink-200">
+                Prepared from the Reference Editor — clip{" "}
+                <span className="text-white">
+                  {transfer.cursor + 1} of {transfer.jobs.length}
+                </span>{" "}
+                loaded below. Review and press Generate when ready.
+                {transfer.jobs.length > 1 && (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      onClick={nextTransferJob}
+                      className="text-accent-400 underline underline-offset-2 hover:text-white"
+                    >
+                      Next clip →
+                    </button>
+                  </>
+                )}
+              </p>
+              <button
+                type="button"
+                onClick={dismissTransfer}
+                className="shrink-0 text-[11px] text-ink-400 transition hover:text-white"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           <Composer
             value={value}
