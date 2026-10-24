@@ -15,10 +15,12 @@ import { imageReferenceBudget, type ModelDef } from "@/lib/models";
  * the provider reject the request after you've waited for it.
  *
  * The video dropzone only renders for a model with `supportsReferenceVideo`
- * set (Kling only, today) — Wan's reference endpoints technically accept a
- * reference video too, but bill it in a way this app can't price upfront
- * (see the Wan model doc comments in lib/models.ts), so the control simply
- * isn't offered rather than being offered and then failing or mis-billing.
+ * set — Kling (flat-rate billing) and Wan 3.0 (additive billing, priced from
+ * the clip's own measured length — see `onVideoDurationChange`). Wan 2.7's
+ * reference endpoint technically accepts a reference video too, but bills it
+ * in a way this app hasn't verified (see the Wan model doc comments in
+ * lib/models.ts), so the control simply isn't offered there rather than
+ * being offered and then failing or mis-billing.
  */
 export default function ReferencePanel({
   model,
@@ -26,12 +28,20 @@ export default function ReferencePanel({
   imageUrls,
   onVideoChange,
   onImagesChange,
+  onVideoDurationChange,
 }: {
   model: ModelDef;
   videoUrl: string;
   imageUrls: string[];
   onVideoChange: (url: string) => void;
   onImagesChange: (urls: string[]) => void;
+  /**
+   * Fires with the uploaded reference video's own duration, in seconds —
+   * only consumed by a model billed "additive" (Wan 3.0 today). Optional so
+   * nothing breaks for a model that doesn't need it; Composer only wires
+   * this up when `model.referenceVideoBilling === "additive"`.
+   */
+  onVideoDurationChange?: (seconds: number) => void;
 }) {
   const budget = imageReferenceBudget(model);
   const shown = imageUrls.slice(0, budget);
@@ -55,8 +65,17 @@ export default function ReferencePanel({
           kind="video"
           value={videoUrl}
           onChange={onVideoChange}
+          onDurationChange={
+            model.referenceVideoBilling === "additive"
+              ? onVideoDurationChange
+              : undefined
+          }
           optional
-          hint="Motion and framing are followed from this clip — say what should stay unchanged. MP4 or MOV, 3–10s, up to 200 MB."
+          hint={
+            model.referenceVideoBilling === "additive"
+              ? `Motion and framing are followed from this clip — say what should stay unchanged. MP4 or MOV, up to ${model.maxReferenceVideoUploadSeconds ?? 15}s, up to 200 MB. Billed as output length plus this clip's own length.`
+              : "Motion and framing are followed from this clip — say what should stay unchanged. MP4 or MOV, 3–10s, up to 200 MB."
+          }
         />
       )}
 
@@ -95,11 +114,18 @@ export default function ReferencePanel({
           Mapping them explicitly stops the model blending them together.
         </p>
 
-        {videoUrl && (
+        {videoUrl && model.referenceVideoBilling !== "additive" && (
           <p className="mt-1.5 text-[11px] text-ink-400">
             With a video attached this runs on Kling O1, which follows the
             clip&apos;s motion, audio <em>and frame shape</em> — the output
             matches this clip&apos;s aspect ratio, not the buttons below.
+          </p>
+        )}
+
+        {videoUrl && model.referenceVideoBilling === "additive" && (
+          <p className="mt-1.5 text-[11px] text-ink-400">
+            Motion is followed from the video; the aspect ratio below still
+            applies.
           </p>
         )}
 
