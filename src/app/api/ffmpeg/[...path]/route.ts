@@ -39,7 +39,14 @@ const FFMPEG_VERSION = "0.12.10";
 const CORE_VERSION = "0.12.10";
 
 const FFMPEG_ESM_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm`;
-const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
+// The ESM core build, not the UMD one. worker.js (above) is itself an ES
+// module, so it loads its core via a dynamic `import()` rather than
+// `importScripts()` — module-type workers can't call `importScripts` at
+// all. `import()`-ing the UMD build (meant for `importScripts`/<script>
+// loading, not for `import`) is what produced ffmpeg.wasm's own
+// "failed to import ffmpeg-core.js" error here; the ESM build is the one
+// actually meant to be loaded this way.
+const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/esm`;
 
 export async function GET(
   _req: Request,
