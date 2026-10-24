@@ -41,6 +41,14 @@ export interface ComposerValue {
   endImageUrl: string;
   referenceVideoUrl: string;
   referenceImageUrls: string[];
+  /**
+   * The reference video's own duration, measured client-side in
+   * ReferencePanel/MediaDrop — only meaningful (and only ever non-zero) for
+   * a model billed "additive" (Wan 3.0 today, see
+   * `ModelDef.referenceVideoBilling`). 0 whenever no reference video is
+   * attached, or while one is still being probed.
+   */
+  referenceVideoDurationSeconds: number;
 }
 
 const RATIO_LABEL: Record<AspectRatio, string> = {
@@ -135,6 +143,7 @@ export default function Composer({
     value.durationSeconds,
     value.withAudio && model.supportsAudio,
     !!value.referenceVideoUrl,
+    value.referenceVideoDurationSeconds,
   );
   // What the user actually pays. The provider figure is the operator's cost,
   // not the price on the button.
@@ -214,14 +223,22 @@ export default function Composer({
   const needsReference =
     isReference && !value.referenceVideoUrl && !value.referenceImageUrls.length;
 
-  // A reference video defines the frame — Kling inherits its shape and the
-  // aspect_ratio parameter does not override it.
-  const ratioFollowsSource = isReference && !!value.referenceVideoUrl;
+  // A reference video defines the frame on Kling's O1 endpoint — it inherits
+  // the clip's shape and the aspect_ratio parameter does not override it.
+  // Wan 3.0's reference endpoint is different: aspect_ratio is sent and
+  // honored there regardless of whether a video is attached, so this only
+  // applies to the flat-billing (Kling) case.
+  const ratioFollowsSource =
+    isReference &&
+    !!value.referenceVideoUrl &&
+    model.referenceVideoBilling !== "additive";
 
   // O1 video-to-video has no tier in its path. Once a reference video is
   // attached, Standard/Pro change nothing about the output and the job bills
   // one flat rate either way — so the control has to say so rather than sit
-  // there looking meaningful.
+  // there looking meaningful. Wan 3.0 keeps its normal std/pro resolution
+  // tiers even with a video attached, so this stays tied to the same
+  // flat-billing case as `ratioFollowsSource` above.
   const tierIgnored = ratioFollowsSource;
 
   // Says whether anything non-default is hiding inside the folded group — a
@@ -277,6 +294,12 @@ export default function Composer({
               referenceVideoUrl: next.supportsReferenceVideo
                 ? value.referenceVideoUrl
                 : "",
+              // Follows the video it describes — dropped together so a
+              // model that can't take the video doesn't keep a stale
+              // duration lying around to price nothing.
+              referenceVideoDurationSeconds: next.supportsReferenceVideo
+                ? value.referenceVideoDurationSeconds
+                : 0,
               // Reference images carry over, but clipped to the new model's
               // own budget — Wan 2.7 allows 4, Wan 3.0 allows 10, and
               // submitting more than a model's endpoint expects is exactly
@@ -396,6 +419,9 @@ export default function Composer({
                 imageUrls={value.referenceImageUrls}
                 onVideoChange={(url) => set("referenceVideoUrl", url)}
                 onImagesChange={(urls) => set("referenceImageUrls", urls)}
+                onVideoDurationChange={(seconds) =>
+                  set("referenceVideoDurationSeconds", seconds)
+                }
               />
             )}
 
