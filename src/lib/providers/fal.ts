@@ -351,6 +351,107 @@ async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
   };
 }
 
+/**
+ * Point-click object/background segmentation (Reference Editor's
+ * hover-to-select step) via fal's SAM 3 — a different fal app than anything
+ * above (`fal-ai/sam-3`, not a video model), reusing the same queue
+ * submit/poll/fetch plumbing and the same `FAL_KEY`. Docs:
+ * https://fal.ai/models/fal-ai/sam-3/image/api
+ *
+ * Submitting and polling use different path forms, confirmed from fal's own
+ * docs rather than assumed from the video endpoints' pattern above: the
+ * submit call needs the full model path (`fal-ai/sam-3/image`), but the
+ * status/result polling calls need just the owner+app (`fal-ai/sam-3`) —
+ * including `/image` in those returns a 405. Easy to get backwards, since
+ * every other model in this file polls under its own submit path's prefix.
+ */
+const SAM_SUBMIT_PATH = "fal-ai/sam-3/image";
+const SAM_APP = "fal-ai/sam-3";
+
+interface SamResult {
+  masks?: { url: string; width?: number; height?: number }[];
+  scores?: number[];
+}
+
+export interface SegmentPointResult {
+  maskUrl: string;
+  score: number;
+}
+
+/**
+ * Asks SAM 3 for the mask of whatever object/background sits under a single
+ * point, given in pixel coordinates against `imageUrl`'s own natural
+ * dimensions (not normalized 0–1) — matching the point/box prompt fields'
+ * naming in fal's schema, which read as pixel-space like a bounding box's
+ * own x_min/y_min would. `imageUrl` has to already be a URL fal's own
+ * servers can fetch — a blob: or data: URL from the browser doesn't work
+ * here, which is why the caller uploads the captured frame to Supabase
+ * Storage first and passes that public URL in.
+ */
+export async function segmentPoint(
+  imageUrl: string,
+  x: number,
+  y: number,
+): Promise<SegmentPointResult> {
+  const submit = await falFetch<FalSubmit & FalStatus>(SAM_SUBMIT_PATH, {
+    method: "POST",
+    body: {
+      image_url: imageUrl,
+      point_prompts: [{ x, y, label: 1 }],
+      return_multiple_masks: false,
+      include_scores: true,
+      output_format: "png",
+    },
+  });
+
+  if (!submit.ok || !submit.json.request_id) {
+    throw new ProviderError(errorText(submit.json), "fal", submit.status);
+  }
+  const requestId = submit.json.request_id;
+
+  // Short synchronous poll rather than fal's webhook flow — this call is
+  // made from an interactive click in the editor and the person is waiting
+  // on screen for the mask to appear, not for a job that finishes minutes
+  // later the way a video generation does. SAM 3's single-point-prompt
+  // calls are normally quick; budgeted to stay comfortably under a
+  // serverless function's own timeout either way.
+  const POLL_INTERVAL_MS = 600;
+  const MAX_ATTEMPTS = 20;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const statusRes = await falFetch<FalStatus>(
+      `${SAM_APP}/requests/${requestId}/status`,
+      { method: "GET" },
+    );
+    if (!statusRes.ok) {
+      throw new ProviderError(errorText(statusRes.json), "fal", statusRes.status);
+    }
+    const mapped = mapStatus(statusRes.json.status);
+    if (mapped === "failed") {
+      throw new ProviderError(errorText(statusRes.json), "fal");
+    }
+    if (mapped === "succeeded") break;
+    if (attempt === MAX_ATTEMPTS - 1) {
+      throw new ProviderError("Segmentation timed out — try clicking again.", "fal");
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  const resultRes = await falFetch<SamResult>(
+    `${SAM_APP}/requests/${requestId}`,
+    { method: "GET" },
+  );
+  const mask = resultRes.json.masks?.[0];
+  if (!resultRes.ok || !mask?.url) {
+    throw new ProviderError(
+      errorText(resultRes.json as { error?: string; detail?: unknown }),
+      "fal",
+      resultRes.status,
+    );
+  }
+
+  return { maskUrl: mask.url, score: resultRes.json.scores?.[0] ?? 0 };
+}
+
 interface FalSubmit {
   request_id: string;
   status?: string;
