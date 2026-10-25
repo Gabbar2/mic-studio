@@ -2,6 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import TrimTimeline from "./TrimTimeline";
+import SceneObjectSelector from "./SceneObjectSelector";
 import ConsentCheckbox, {
   UploadConsentProvider,
   useUploadConsent,
@@ -93,6 +94,9 @@ function ReferenceEditorInner() {
   // means "included": a clip is on by default the moment it appears, with
   // no flash of being unchecked first.
   const [included, setIncluded] = useState<Record<string, boolean>>({});
+  // Which clip's object/background selector is open — null when closed.
+  // Only one at a time; the selector is a full-screen modal.
+  const [selectorClipId, setSelectorClipId] = useState<string | null>(null);
 
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
@@ -266,6 +270,17 @@ function ReferenceEditorInner() {
   const selectedJobs = clips
     .filter((c) => included[c.job.id] !== false)
     .map((c) => c.job);
+
+  const selectorClip = clips.find((c) => c.job.id === selectorClipId) ?? null;
+
+  function savePromptForClip(clipId: string, prompt: string) {
+    setClips((prev) =>
+      prev.map((c) =>
+        c.job.id === clipId ? { ...c, job: { ...c.job, prompt } } : c,
+      ),
+    );
+    setSelectorClipId(null);
+  }
 
   function continueInStudio() {
     if (selectedJobs.length === 0) return;
@@ -561,6 +576,22 @@ function ReferenceEditorInner() {
                         ↗
                       </a>
                     </div>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        // Opening the selector isn't about this checkbox —
+                        // without this, the click would also toggle include
+                        // state, since the whole tile is a <label>.
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSelectorClipId(c.job.id);
+                      }}
+                      className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-center text-[10px] text-accent-400 hover:bg-ink-850 hover:text-white"
+                    >
+                      {c.job.prompt
+                        ? "Selections set — edit →"
+                        : "Select objects →"}
+                    </button>
                   </label>
                 );
               })}
@@ -589,11 +620,24 @@ function ReferenceEditorInner() {
       {/* --- Coming next ----------------------------------------------- */}
       <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
         <span className="font-medium text-ink-200">Coming next:</span>{" "}
-        hover-to-select objects/backgrounds with real AI segmentation, and
-        ChatGPT-drafted editing prompts per element. For now, review the
-        detected scenes above, drop any you don&apos;t want, and write your
-        prompt and attach any reference images once you land in Mic Studio.
+        real ChatGPT-drafted editing prompts per selected element — for now,
+        naming a selection builds a short starter prompt listing it, which
+        you can edit further once you land in Mic Studio.
       </div>
+
+      {selectorClip && meta && (
+        <SceneObjectSelector
+          sourceUrl={sourceUrl}
+          sourceWidth={meta.width}
+          sourceHeight={meta.height}
+          clipStart={selectorClip.start}
+          clipEnd={selectorClip.end}
+          initialPrompt={selectorClip.job.prompt}
+          granted={granted}
+          onClose={() => setSelectorClipId(null)}
+          onSave={(prompt) => savePromptForClip(selectorClip.job.id, prompt)}
+        />
+      )}
     </div>
   );
 }
