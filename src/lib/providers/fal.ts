@@ -352,11 +352,10 @@ async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
 }
 
 /**
- * Point-click object/background segmentation (Reference Editor's
- * hover-to-select step) via fal's SAM 3 — a different fal app than anything
- * above (`fal-ai/sam-3`, not a video model), reusing the same queue
- * submit/poll/fetch plumbing and the same `FAL_KEY`. Docs:
- * https://fal.ai/models/fal-ai/sam-3/image/api
+ * Object/background segmentation (Reference Editor's select-to-keep step)
+ * via fal's SAM 3 — a different fal app than anything above (`fal-ai/sam-3`,
+ * not a video model), reusing the same queue submit/poll/fetch plumbing and
+ * the same `FAL_KEY`. Docs: https://fal.ai/models/fal-ai/sam-3/image/api
  *
  * Submitting and polling use different path forms, confirmed from fal's own
  * docs rather than assumed from the video endpoints' pattern above: the
@@ -364,6 +363,17 @@ async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
  * status/result polling calls need just the owner+app (`fal-ai/sam-3`) —
  * including `/image` in those returns a 405. Easy to get backwards, since
  * every other model in this file polls under its own submit path's prefix.
+ *
+ * SAM 3 is Meta's *promptable concept* segmentation, not classic
+ * click-anywhere SAM — it finds whatever a short text phrase describes
+ * ("the red jacket", "the background wall"), not whatever sits under a
+ * pixel coordinate. The first version of this integration sent only a
+ * point and no text, which silently fell back to fal's own documented
+ * default concept ("wheel") and came back empty on every image that didn't
+ * contain one — a model-shape mismatch, not a coordinate bug. `point_prompts`
+ * do exist in the schema, but only to disambiguate *among* a text match's
+ * detections, not to replace one, so this takes a text description, not a
+ * click point.
  */
 const SAM_SUBMIT_PATH = "fal-ai/sam-3/image";
 const SAM_APP = "fal-ai/sam-3";
@@ -373,31 +383,27 @@ interface SamResult {
   scores?: number[];
 }
 
-export interface SegmentPointResult {
+export interface SegmentResult {
   maskUrl: string;
   score: number;
 }
 
 /**
- * Asks SAM 3 for the mask of whatever object/background sits under a single
- * point, given in pixel coordinates against `imageUrl`'s own natural
- * dimensions (not normalized 0–1) — matching the point/box prompt fields'
- * naming in fal's schema, which read as pixel-space like a bounding box's
- * own x_min/y_min would. `imageUrl` has to already be a URL fal's own
- * servers can fetch — a blob: or data: URL from the browser doesn't work
- * here, which is why the caller uploads the captured frame to Supabase
- * Storage first and passes that public URL in.
+ * Asks SAM 3 for the mask of whatever `prompt` describes in `imageUrl` —
+ * e.g. "the red jacket", "the dog", "the background wall". `imageUrl` has
+ * to already be a URL fal's own servers can fetch — a blob: or data: URL
+ * from the browser doesn't work here, which is why the caller uploads the
+ * captured frame to Supabase Storage first and passes that public URL in.
  */
-export async function segmentPoint(
+export async function segmentByPrompt(
   imageUrl: string,
-  x: number,
-  y: number,
-): Promise<SegmentPointResult> {
+  prompt: string,
+): Promise<SegmentResult> {
   const submit = await falFetch<FalSubmit & FalStatus>(SAM_SUBMIT_PATH, {
     method: "POST",
     body: {
       image_url: imageUrl,
-      point_prompts: [{ x, y, label: 1 }],
+      prompt,
       return_multiple_masks: false,
       include_scores: true,
       output_format: "png",
@@ -431,7 +437,7 @@ export async function segmentPoint(
     }
     if (mapped === "succeeded") break;
     if (attempt === MAX_ATTEMPTS - 1) {
-      throw new ProviderError("Segmentation timed out — try clicking again.", "fal");
+      throw new ProviderError("Segmentation timed out — try again.", "fal");
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
@@ -440,12 +446,22 @@ export async function segmentPoint(
     `${SAM_APP}/requests/${requestId}`,
     { method: "GET" },
   );
-  const mask = resultRes.json.masks?.[0];
-  if (!resultRes.ok || !mask?.url) {
+  if (!resultRes.ok) {
     throw new ProviderError(
       errorText(resultRes.json as { error?: string; detail?: unknown }),
       "fal",
       resultRes.status,
+    );
+  }
+  const mask = resultRes.json.masks?.[0];
+  if (!mask?.url) {
+    // A clean 200 with an empty masks array is SAM 3 saying "nothing in
+    // this image matches that description" — not a request error, so it
+    // gets its own message rather than errorText's generic fallback (which
+    // would otherwise just dump the empty {masks:[],scores:[],...} body).
+    throw new ProviderError(
+      "Nothing found matching that description — try a different phrase.",
+      "fal",
     );
   }
 
