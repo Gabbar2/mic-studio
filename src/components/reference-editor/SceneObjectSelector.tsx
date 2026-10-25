@@ -12,23 +12,27 @@ interface Selection {
 
 interface PendingMask {
   maskUrl: string;
-  x: number;
-  y: number;
+  name: string;
 }
 
 /**
- * Point-click object/background selection for one prepared scene clip —
- * Phase 2's hover-to-select step. A representative frame of the clip is
- * captured and uploaded once (fal's segmentation model needs a real URL it
- * can fetch; a blob: URL from the browser doesn't work there), then each
- * click on it is sent to `/api/segment`, which calls fal's SAM 3 and
- * returns a mask image for whatever sits under that point.
+ * Describe-to-select object/background selection for one prepared scene
+ * clip — Phase 2's select-to-keep step. A representative frame of the clip
+ * is captured and uploaded once (fal's segmentation model needs a real URL
+ * it can fetch; a blob: URL from the browser doesn't work there).
+ *
+ * Describing what to select, not clicking it: SAM 3 is a *text-concept*
+ * segmentation model, not classic click-anywhere SAM — a point alone, with
+ * no description, silently fell back to fal's own default search concept
+ * and never found anything on a real frame. Typing a short phrase ("the red
+ * jacket", "the dog") is both what the model actually needs and, usefully,
+ * doubles as the selection's name — no separate naming step after the fact.
  *
  * ChatGPT prompt drafting stays mocked for now (per an earlier explicit
- * choice) — rather than leave selected objects/backgrounds unused, naming
- * each one here builds a short starter prompt listing them, in the same
- * "name it so the model doesn't blend it" style Mic Studio's own composer
- * already uses for reference images.
+ * choice) — rather than leave selected objects/backgrounds unused, the list
+ * of kept descriptions builds a short starter prompt, in the same "name it
+ * so the model doesn't blend it" style Mic Studio's own composer already
+ * uses for reference images.
  */
 export default function SceneObjectSelector({
   sourceUrl,
@@ -52,15 +56,13 @@ export default function SceneObjectSelector({
   onSave: (prompt: string) => void;
 }) {
   const nameSeq = useRef(0);
-  const imgRef = useRef<HTMLImageElement>(null);
 
   const [frameDataUrl, setFrameDataUrl] = useState<string | null>(null);
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
-  const [frameSize, setFrameSize] = useState({ width: 960, height: 540 });
   const [loadingFrame, setLoadingFrame] = useState(true);
+  const [describeText, setDescribeText] = useState("");
   const [segmenting, setSegmenting] = useState(false);
   const [pending, setPending] = useState<PendingMask | null>(null);
-  const [pendingName, setPendingName] = useState("");
   const [selections, setSelections] = useState<Selection[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -94,7 +96,6 @@ export default function SceneObjectSelector({
         }
         if (cancelled) return;
         setFrameDataUrl(dataUrl);
-        setFrameSize({ width, height });
 
         const blob = await (await fetch(dataUrl)).blob();
         nameSeq.current += 1;
@@ -122,16 +123,9 @@ export default function SceneObjectSelector({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceUrl, clipStart, clipEnd]);
 
-  async function handleFrameClick(e: React.MouseEvent<HTMLImageElement>) {
-    if (!frameUrl || segmenting) return;
-    const img = imgRef.current;
-    if (!img) return;
-
-    const rect = img.getBoundingClientRect();
-    const relX = (e.clientX - rect.left) / rect.width;
-    const relY = (e.clientY - rect.top) / rect.height;
-    const x = Math.round(relX * frameSize.width);
-    const y = Math.round(relY * frameSize.height);
+  async function handleDetect() {
+    const text = describeText.trim();
+    if (!frameUrl || !text || segmenting) return;
 
     setSegmenting(true);
     setError(null);
@@ -140,16 +134,15 @@ export default function SceneObjectSelector({
       const res = await fetch("/api/segment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageUrl: frameUrl, x, y }),
+        body: JSON.stringify({ imageUrl: frameUrl, prompt: text }),
       });
       const json = (await res.json()) as { maskUrl?: string; error?: string };
       if (!res.ok || !json.maskUrl) {
-        throw new Error(json.error ?? "Could not detect anything there.");
+        throw new Error(json.error ?? "Could not detect that.");
       }
-      setPending({ maskUrl: json.maskUrl, x, y });
-      setPendingName("");
+      setPending({ maskUrl: json.maskUrl, name: text });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not detect anything there.");
+      setError(e instanceof Error ? e.message : "Could not detect that.");
     } finally {
       setSegmenting(false);
     }
@@ -160,14 +153,10 @@ export default function SceneObjectSelector({
     nameSeq.current += 1;
     setSelections((prev) => [
       ...prev,
-      {
-        id: `sel-${nameSeq.current}`,
-        name: pendingName.trim() || `Selection ${prev.length + 1}`,
-        maskUrl: pending.maskUrl,
-      },
+      { id: `sel-${nameSeq.current}`, name: pending.name, maskUrl: pending.maskUrl },
     ]);
     setPending(null);
-    setPendingName("");
+    setDescribeText("");
   }
 
   function removeSelection(id: string) {
@@ -206,9 +195,10 @@ export default function SceneObjectSelector({
           </button>
         </div>
         <p className="text-[11px] leading-relaxed text-ink-400">
-          Click a person, object, or background in the frame below to detect
-          it, then give it a short name. Named selections get listed in the
-          prompt so the model knows to keep them unchanged.
+          Describe a person, object, or background in the frame below — e.g.
+          &quot;the red jacket&quot; or &quot;the background wall&quot; —
+          then press Detect. Keep the ones you want preserved; they get
+          listed in the prompt so the model doesn&apos;t blend them away.
         </p>
 
         {loadingFrame && (
@@ -218,23 +208,19 @@ export default function SceneObjectSelector({
         )}
 
         {frameDataUrl && (
-          <div className="relative overflow-hidden rounded-lg border border-ink-650 bg-black">
+          <div className="relative flex max-h-[45vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              ref={imgRef}
               src={frameDataUrl}
               alt=""
-              onClick={(e) => void handleFrameClick(e)}
-              className={`block w-full ${
-                frameUrl && !segmenting ? "cursor-crosshair" : "cursor-wait"
-              }`}
+              className="max-h-[45vh] w-auto max-w-full object-contain"
             />
             {pending && (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={pending.maskUrl}
                 alt=""
-                className="pointer-events-none absolute inset-0 h-full w-full object-fill opacity-60 mix-blend-screen"
+                className="pointer-events-none absolute inset-0 h-full w-full object-contain opacity-60 mix-blend-screen"
               />
             )}
             {segmenting && (
@@ -245,30 +231,52 @@ export default function SceneObjectSelector({
           </div>
         )}
 
-        {pending && (
-          <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
+        {!pending && (
+          <div className="flex items-center gap-2">
             <input
               type="text"
-              value={pendingName}
-              onChange={(e) => setPendingName(e.target.value)}
-              placeholder="Name this selection — e.g. “the jacket”"
-              className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2 py-1 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-              autoFocus
+              value={describeText}
+              onChange={(e) => setDescribeText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleDetect();
+              }}
+              placeholder="What do you want to select? e.g. “the dog”"
+              disabled={!frameUrl || segmenting}
+              className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
             />
             <button
               type="button"
-              onClick={keepPending}
-              className="shrink-0 rounded-md bg-accent-500 px-2.5 py-1 text-xs font-semibold text-accent-ink hover:bg-accent-400"
+              onClick={() => void handleDetect()}
+              disabled={!frameUrl || !describeText.trim() || segmenting}
+              className="shrink-0 rounded-md bg-accent-500 px-3 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
             >
-              Add
+              Detect
             </button>
-            <button
-              type="button"
-              onClick={() => setPending(null)}
-              className="shrink-0 text-xs text-ink-400 hover:text-white"
-            >
-              Discard
-            </button>
+          </div>
+        )}
+
+        {pending && (
+          <div className="flex items-center justify-between gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
+            <span className="text-xs text-ink-200">
+              Found <span className="text-white">“{pending.name}”</span> —
+              keep it?
+            </span>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={keepPending}
+                className="rounded-md bg-accent-500 px-2.5 py-1 text-xs font-semibold text-accent-ink hover:bg-accent-400"
+              >
+                Keep
+              </button>
+              <button
+                type="button"
+                onClick={() => setPending(null)}
+                className="text-xs text-ink-400 hover:text-white"
+              >
+                Discard
+              </button>
+            </div>
           </div>
         )}
 
