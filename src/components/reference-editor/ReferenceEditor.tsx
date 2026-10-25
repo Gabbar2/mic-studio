@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 import TrimTimeline from "./TrimTimeline";
 import ConsentCheckbox, {
   UploadConsentProvider,
@@ -67,7 +66,6 @@ export default function ReferenceEditor() {
 }
 
 function ReferenceEditorInner() {
-  const router = useRouter();
   const { granted } = useUploadConsent();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
@@ -272,7 +270,18 @@ function ReferenceEditorInner() {
   function continueInStudio() {
     if (selectedJobs.length === 0) return;
     writeReferenceTransfer(selectedJobs);
-    router.push("/studio");
+    // A full browser navigation, not router.push — Studio's mount effect
+    // (the one that reads the prepared clips back out of sessionStorage)
+    // only ever runs once, on mount. If Studio was already visited earlier
+    // in this tab this session, Next's client-side router can reuse its
+    // cached render of that page instead of remounting it, which means that
+    // effect never fires again and the just-written transfer sits unread —
+    // landing on a stale Studio page with none of these clips loaded. A
+    // real navigation guarantees a fresh mount every time, at the cost of
+    // a full page reload for what's a one-time hop between two different
+    // parts of the app anyway.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- deliberate: see comment above
+    window.location.href = "/studio";
   }
 
   return (
