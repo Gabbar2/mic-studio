@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { uploadMedia } from "@/lib/upload";
 import { captureThumbnail } from "@/lib/videoThumbnail";
 
@@ -14,6 +14,25 @@ interface Selection {
 interface PendingMask {
   maskUrl: string;
   name: string;
+}
+
+/** A manually dragged rectangle, in 0–1 fractions of the frame image — not
+ * pixels, so it stays correct regardless of how large the frame is rendered
+ * on screen. */
+interface DragRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+function normalizeRect(r: DragRect) {
+  return {
+    left: Math.min(r.x0, r.x1),
+    top: Math.min(r.y0, r.y1),
+    right: Math.max(r.x0, r.x1),
+    bottom: Math.max(r.y0, r.y1),
+  };
 }
 
 /**
@@ -49,6 +68,18 @@ const HIGHLIGHT_COLORS = [
  * of kept descriptions builds a short starter prompt, in the same "name it
  * so the model doesn't blend it" style Mic Studio's own composer already
  * uses for reference images.
+ *
+ * "Draw manually" (the Photoshop-marquee-style fallback) is a separate,
+ * entirely client-side path — not a fal call at all. SAM 3 can miss a
+ * concept outright ("grapefruit" finding nothing) or lump distinct objects
+ * into one mask ("fruit" matching everything fruit-shaped at once), and
+ * there's no model-side fix for that short of better prompt wording; a
+ * person dragging a box around exactly what they mean is the reliable
+ * fallback. The dragged rectangle is rasterized straight into a mask image
+ * in the browser (a filled rect on a transparent canvas) and treated
+ * identically to an AI-found mask everywhere after that — same highlight
+ * overlay, same prompt-building — so nothing downstream needs to know which
+ * selections came from which path.
  */
 export default function SceneObjectSelector({
   sourceUrl,
@@ -72,8 +103,13 @@ export default function SceneObjectSelector({
   onSave: (prompt: string) => void;
 }) {
   const nameSeq = useRef(0);
+  const frameBoxRef = useRef<HTMLDivElement | null>(null);
 
   const [frameDataUrl, setFrameDataUrl] = useState<string | null>(null);
+  const [frameSize, setFrameSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [loadingFrame, setLoadingFrame] = useState(true);
   const [describeText, setDescribeText] = useState("");
@@ -86,6 +122,15 @@ export default function SceneObjectSelector({
   const [pillBusy, setPillBusy] = useState<string | null>(null);
   const nextColor = (count: number) =>
     HIGHLIGHT_COLORS[count % HIGHLIGHT_COLORS.length];
+
+  // Manual "draw a box" fallback — see the component doc comment above.
+  const [manualMode, setManualMode] = useState(false);
+  const [dragRect, setDragRect] = useState<DragRect | null>(null);
+  const [pendingManualRect, setPendingManualRect] = useState<DragRect | null>(
+    null,
+  );
+  const [manualName, setManualName] = useState("");
+  const draggingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -117,6 +162,7 @@ export default function SceneObjectSelector({
         }
         if (cancelled) return;
         setFrameDataUrl(dataUrl);
+        setFrameSize({ width, height });
 
         const blob = await (await fetch(dataUrl)).blob();
         nameSeq.current += 1;
@@ -222,6 +268,90 @@ export default function SceneObjectSelector({
 
   function removeSelection(id: string) {
     setSelections((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  /** 0–1 fraction of the frame image under a pointer event, clamped so a
+   * drag that leaves the image (e.g. onto the letterbox bars) still resolves
+   * to a valid point instead of going out of bounds. */
+  function fractionFromEvent(e: PointerEvent): { x: number; y: number } {
+    const box = frameBoxRef.current?.getBoundingClientRect();
+    if (!box || box.width === 0 || box.height === 0) return { x: 0, y: 0 };
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - box.top) / box.height)),
+    };
+  }
+
+  function startManualDraw(e: PointerEvent) {
+    if (!manualMode) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
+    const { x, y } = fractionFromEvent(e);
+    setDragRect({ x0: x, y0: y, x1: x, y1: y });
+  }
+
+  function moveManualDraw(e: PointerEvent) {
+    if (!draggingRef.current) return;
+    const { x, y } = fractionFromEvent(e);
+    setDragRect((prev) => (prev ? { ...prev, x1: x, y1: y } : prev));
+  }
+
+  function endManualDraw() {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    setDragRect((prev) => {
+      if (!prev) return null;
+      const r = normalizeRect(prev);
+      // Ignore an accidental tap/click — require a real drag.
+      if (r.right - r.left < 0.02 || r.bottom - r.top < 0.02) return null;
+      setPendingManualRect(prev);
+      setManualName("");
+      return null;
+    });
+  }
+
+  /** Rasterizes a fractional rectangle into a standalone mask image — a
+   * filled white rect on a transparent canvas, at the frame's own pixel
+   * size, so it composites with the colored-highlight CSS mask the exact
+   * same way a fal-returned mask does. */
+  function rectToMaskDataUrl(rect: DragRect): string | null {
+    if (!frameSize) return null;
+    const r = normalizeRect(rect);
+    const canvas = document.createElement("canvas");
+    canvas.width = frameSize.width;
+    canvas.height = frameSize.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(
+      r.left * frameSize.width,
+      r.top * frameSize.height,
+      (r.right - r.left) * frameSize.width,
+      (r.bottom - r.top) * frameSize.height,
+    );
+    return canvas.toDataURL("image/png");
+  }
+
+  function confirmManualSelection() {
+    const name = manualName.trim();
+    if (!pendingManualRect || !name) return;
+    const maskUrl = rectToMaskDataUrl(pendingManualRect);
+    if (!maskUrl) {
+      setError("Could not create that selection — try again.");
+      return;
+    }
+    nameSeq.current += 1;
+    setSelections((prev) => [
+      ...prev,
+      {
+        id: `sel-${nameSeq.current}`,
+        name,
+        maskUrl,
+        color: nextColor(prev.length),
+      },
+    ]);
+    setPendingManualRect(null);
+    setManualName("");
   }
 
   function selectionForLabel(label: string) {
@@ -334,53 +464,148 @@ export default function SceneObjectSelector({
 
         {frameDataUrl && (
           <div className="relative flex max-h-[45vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={frameDataUrl}
-              alt=""
-              className="max-h-[45vh] w-auto max-w-full object-contain"
-            />
             {/*
-             * Every kept selection stays highlighted on the frame, not just
-             * the one currently being detected — this is the closest this
-             * text-concept model can get to a true hover/long-press
-             * highlight (SAM 3 has no cheap per-pixel "what's under the
-             * cursor" query; each highlight here is the result of an actual
-             * billed detection call, not a live probe). Tinted with
-             * mask-image/background-color rather than mix-blend-screen so
-             * several selections read as distinct colors instead of
-             * stacking into one white blob.
+             * Tightly wraps the img (no extra width from the centering flex
+             * parent above) so every absolutely-positioned child here lines
+             * up with the rendered frame pixel-for-pixel, both the
+             * highlight overlays below and the manual-draw pointer math in
+             * fractionFromEvent, which measures this div's own rect.
              */}
-            {selections.map((s) => (
-              <div
-                key={s.id}
-                className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
-                style={{
-                  backgroundColor: s.color,
-                  WebkitMaskImage: `url(${s.maskUrl})`,
-                  maskImage: `url(${s.maskUrl})`,
-                  WebkitMaskSize: "contain",
-                  maskSize: "contain",
-                  WebkitMaskRepeat: "no-repeat",
-                  maskRepeat: "no-repeat",
-                  WebkitMaskPosition: "center",
-                  maskPosition: "center",
-                }}
-              />
-            ))}
-            {pending && (
-              // eslint-disable-next-line @next/next/no-img-element
+            <div ref={frameBoxRef} className="relative inline-block">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
-                src={pending.maskUrl}
+                src={frameDataUrl}
                 alt=""
-                className="pointer-events-none absolute inset-0 h-full w-full animate-pulse object-contain opacity-70 mix-blend-screen"
+                draggable={false}
+                className="block max-h-[45vh] w-auto max-w-full select-none object-contain"
               />
-            )}
-            {segmenting && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-xs text-white">
-                Detecting…
-              </div>
-            )}
+              {/*
+               * Every kept selection stays highlighted on the frame, not
+               * just the one currently being detected — the closest a
+               * text-concept model (or a hand-drawn box) gets to a true
+               * hover/long-press highlight. Tinted with mask-image/
+               * background-color rather than mix-blend-screen so several
+               * selections read as distinct colors instead of stacking into
+               * one white blob.
+               */}
+              {selections.map((s) => (
+                <div
+                  key={s.id}
+                  className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
+                  style={{
+                    backgroundColor: s.color,
+                    WebkitMaskImage: `url(${s.maskUrl})`,
+                    maskImage: `url(${s.maskUrl})`,
+                    WebkitMaskSize: "contain",
+                    maskSize: "contain",
+                    WebkitMaskRepeat: "no-repeat",
+                    maskRepeat: "no-repeat",
+                    WebkitMaskPosition: "center",
+                    maskPosition: "center",
+                  }}
+                />
+              ))}
+              {pending && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={pending.maskUrl}
+                  alt=""
+                  className="pointer-events-none absolute inset-0 h-full w-full animate-pulse object-contain opacity-70 mix-blend-screen"
+                />
+              )}
+              {segmenting && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-xs text-white">
+                  Detecting…
+                </div>
+              )}
+              {/*
+               * Manual draw surface — only intercepts pointer events while
+               * manualMode is on, so it doesn't swallow clicks the rest of
+               * the time. Pointer Events (not mouse/touch separately) cover
+               * both a mouse drag and a finger drag on mobile in one path.
+               */}
+              {manualMode && (
+                <div
+                  className="absolute inset-0 cursor-crosshair touch-none"
+                  onPointerDown={startManualDraw}
+                  onPointerMove={moveManualDraw}
+                  onPointerUp={endManualDraw}
+                  onPointerCancel={endManualDraw}
+                >
+                  {dragRect &&
+                    (() => {
+                      const r = normalizeRect(dragRect);
+                      return (
+                        <div
+                          className="pointer-events-none absolute border-2 border-dashed border-accent-400 bg-accent-400/15"
+                          style={{
+                            left: `${r.left * 100}%`,
+                            top: `${r.top * 100}%`,
+                            width: `${(r.right - r.left) * 100}%`,
+                            height: `${(r.bottom - r.top) * 100}%`,
+                          }}
+                        />
+                      );
+                    })()}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {frameUrl && (
+          <button
+            type="button"
+            onClick={() => {
+              setManualMode((m) => !m);
+              setDragRect(null);
+              setPendingManualRect(null);
+            }}
+            className={`self-start rounded-md border px-2.5 py-1 text-[11px] font-medium transition ${
+              manualMode
+                ? "border-accent-500 bg-accent-500/15 text-accent-300"
+                : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
+            }`}
+          >
+            {manualMode ? "✓ Drawing — tap again to stop" : "✎ Draw a selection manually"}
+          </button>
+        )}
+
+        {pendingManualRect && (
+          <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
+            <input
+              type="text"
+              autoFocus
+              value={manualName}
+              onChange={(e) => setManualName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") confirmManualSelection();
+                if (e.key === "Escape") {
+                  setPendingManualRect(null);
+                  setManualName("");
+                }
+              }}
+              placeholder="Name this selection, e.g. “the grapefruit”"
+              className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+            />
+            <button
+              type="button"
+              onClick={confirmManualSelection}
+              disabled={!manualName.trim()}
+              className="shrink-0 rounded-md bg-accent-500 px-3 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+            >
+              Add
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPendingManualRect(null);
+                setManualName("");
+              }}
+              className="shrink-0 text-xs text-ink-400 hover:text-white"
+            >
+              Cancel
+            </button>
           </div>
         )}
 
