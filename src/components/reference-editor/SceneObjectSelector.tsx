@@ -81,6 +81,11 @@ export default function SceneObjectSelector({
   const [pending, setPending] = useState<PendingMask | null>(null);
   const [selections, setSelections] = useState<Selection[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [candidates, setCandidates] = useState<string[]>([]);
+  const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [pillBusy, setPillBusy] = useState<string | null>(null);
+  const nextColor = (count: number) =>
+    HIGHLIGHT_COLORS[count % HIGHLIGHT_COLORS.length];
 
   useEffect(() => {
     let cancelled = false;
@@ -139,6 +144,41 @@ export default function SceneObjectSelector({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceUrl, clipStart, clipEnd]);
 
+  // Auto-detect pills: a best-effort suggestion list, so most of the time
+  // nobody has to type a description from scratch at all. Deliberately
+  // separate from the frame-prep effect above and from the blocking `error`
+  // state — Florence-2 having a bad moment, or finding nothing, should never
+  // stop the rest of the selector from working; it just means the pill row
+  // stays empty and manual typing is still right there.
+  useEffect(() => {
+    if (!frameUrl) return;
+    let cancelled = false;
+
+    (async () => {
+      setLoadingCandidates(true);
+      setCandidates([]);
+      try {
+        const res = await fetch("/api/detect-labels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageUrl: frameUrl }),
+        });
+        const json = (await res.json()) as { labels?: unknown };
+        if (!cancelled && res.ok && Array.isArray(json.labels)) {
+          setCandidates(json.labels.filter((l): l is string => typeof l === "string"));
+        }
+      } catch {
+        // Best-effort — see comment above.
+      } finally {
+        if (!cancelled) setLoadingCandidates(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [frameUrl]);
+
   async function handleDetect() {
     const text = describeText.trim();
     if (!frameUrl || !text || segmenting) return;
@@ -173,7 +213,7 @@ export default function SceneObjectSelector({
         id: `sel-${nameSeq.current}`,
         name: pending.name,
         maskUrl: pending.maskUrl,
-        color: HIGHLIGHT_COLORS[prev.length % HIGHLIGHT_COLORS.length],
+        color: nextColor(prev.length),
       },
     ]);
     setPending(null);
@@ -182,6 +222,56 @@ export default function SceneObjectSelector({
 
   function removeSelection(id: string) {
     setSelections((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  function selectionForLabel(label: string) {
+    const needle = label.trim().toLowerCase();
+    return selections.find((s) => s.name.trim().toLowerCase() === needle);
+  }
+
+  /**
+   * One click on an auto-detected pill either adds or removes it — unlike
+   * the manual-typing path, there's no "Found X — keep it?" confirmation
+   * step here, since Florence-2 already named the object before the pill
+   * ever appeared; SAM 3 is only asked to turn that name into a mask.
+   */
+  async function addByLabel(label: string) {
+    const existing = selectionForLabel(label);
+    if (existing) {
+      removeSelection(existing.id);
+      return;
+    }
+    if (!frameUrl || pillBusy) return;
+
+    setPillBusy(label);
+    setError(null);
+    try {
+      const res = await fetch("/api/segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: frameUrl, prompt: label }),
+      });
+      const json = (await res.json()) as { maskUrl?: string; error?: string };
+      if (!res.ok || !json.maskUrl) {
+        throw new Error(json.error ?? `Could not detect "${label}".`);
+      }
+      nameSeq.current += 1;
+      setSelections((prev) => [
+        ...prev,
+        {
+          id: `sel-${nameSeq.current}`,
+          name: label,
+          maskUrl: json.maskUrl!,
+          color: nextColor(prev.length),
+        },
+      ]);
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : `Could not detect "${label}".`,
+      );
+    } finally {
+      setPillBusy(null);
+    }
   }
 
   // Wrapped defensively: onSave ultimately runs the parent's state update
@@ -228,9 +318,9 @@ export default function SceneObjectSelector({
           </button>
         </div>
         <p className="text-[11px] leading-relaxed text-ink-400">
-          Describe a person, object, or background in the frame below — e.g.
-          &quot;the red jacket&quot; or &quot;the background wall&quot; —
-          then press Detect. Keep the ones you want preserved; each stays
+          Tap a suggested object below the frame to add it, or describe
+          anything else — e.g. &quot;the red jacket&quot; or &quot;the
+          background wall&quot; — and press Detect. Each kept selection stays
           highlighted in its own color so you can see everything you&apos;ve
           kept at once, and gets listed in the prompt so the model
           doesn&apos;t blend it away.
@@ -291,6 +381,43 @@ export default function SceneObjectSelector({
                 Detecting…
               </div>
             )}
+          </div>
+        )}
+
+        {frameUrl && (loadingCandidates || candidates.length > 0) && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {loadingCandidates && candidates.length === 0 && (
+              <span className="text-[11px] text-ink-500">
+                Finding objects…
+              </span>
+            )}
+            {candidates.map((label) => {
+              const sel = selectionForLabel(label);
+              const busy = pillBusy === label;
+              return (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => void addByLabel(label)}
+                  disabled={busy}
+                  className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition disabled:cursor-wait disabled:opacity-60 ${
+                    sel
+                      ? "border-transparent text-white"
+                      : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
+                  }`}
+                  style={sel ? { backgroundColor: `${sel.color}33` } : undefined}
+                >
+                  {sel && (
+                    <span
+                      className="h-1.5 w-1.5 rounded-full"
+                      style={{ backgroundColor: sel.color }}
+                      aria-hidden
+                    />
+                  )}
+                  {busy ? "Detecting…" : label}
+                </button>
+              );
+            })}
           </div>
         )}
 
