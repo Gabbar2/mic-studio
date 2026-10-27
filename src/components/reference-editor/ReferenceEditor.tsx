@@ -550,14 +550,21 @@ function ReferenceEditorInner() {
                       className="absolute right-1.5 top-1.5 z-10 h-4 w-4 accent-accent-500"
                     />
                     {c.thumbnail ? (
+                      // A fixed-height, letterboxed frame rather than a
+                      // forced 16:9 crop — these reference clips are just as
+                      // often 9:16, and cropping or stretching a portrait
+                      // thumbnail into a landscape box is what made this
+                      // tile look warped before. object-contain keeps the
+                      // actual frame undistorted; the dark bars fill
+                      // whatever's left in the box.
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         src={c.thumbnail}
                         alt=""
-                        className="aspect-video w-full object-cover"
+                        className="flex h-32 w-full items-center justify-center bg-ink-900 object-contain"
                       />
                     ) : (
-                      <div className="flex aspect-video w-full items-center justify-center bg-ink-900 text-[10px] text-ink-500">
+                      <div className="flex h-32 w-full items-center justify-center bg-ink-900 text-[10px] text-ink-500">
                         No preview
                       </div>
                     )}
