@@ -35,6 +35,33 @@ function normalizeRect(r: DragRect) {
   };
 }
 
+/** A point in a freehand (pencil) stroke, same 0–1 fraction convention as
+ * DragRect. */
+interface Point {
+  x: number;
+  y: number;
+}
+
+/** A finished manual selection waiting to be named — either shape rasterizes
+ * to a mask the same way everything downstream (highlight overlay, Done's
+ * prompt text) is already built to consume. */
+type ManualShape =
+  | { kind: "box"; rect: DragRect }
+  | { kind: "pencil"; points: Point[] };
+
+/** Bounding box of a freehand stroke, in the same shape normalizeRect
+ * returns, so both shapes can share one minimum-size check. */
+function pointsBounds(points: Point[]) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  return {
+    left: Math.min(...xs),
+    top: Math.min(...ys),
+    right: Math.max(...xs),
+    bottom: Math.max(...ys),
+  };
+}
+
 /**
  * Distinct, colorblind-friendlyish hues so several kept selections read as
  * separate highlights at a glance rather than one blob. Cycles if there are
@@ -123,12 +150,16 @@ export default function SceneObjectSelector({
   const nextColor = (count: number) =>
     HIGHLIGHT_COLORS[count % HIGHLIGHT_COLORS.length];
 
-  // Manual "draw a box" fallback — see the component doc comment above.
+  // Manual drawing fallback — see the component doc comment above. Two
+  // shapes share one pending/name/confirm flow: "box" is the original drag-
+  // a-rectangle tool, "pencil" is freehand (any shape, not just a rounded
+  // blob — straight edges, a cutout, whatever the box tool can't follow).
   const [manualMode, setManualMode] = useState(false);
+  const [drawShape, setDrawShape] = useState<"box" | "pencil">("box");
   const [dragRect, setDragRect] = useState<DragRect | null>(null);
-  const [pendingManualRect, setPendingManualRect] = useState<DragRect | null>(
-    null,
-  );
+  const [freehandPoints, setFreehandPoints] = useState<Point[] | null>(null);
+  const [pendingManualShape, setPendingManualShape] =
+    useState<ManualShape | null>(null);
   const [manualName, setManualName] = useState("");
   const draggingRef = useRef(false);
 
@@ -286,56 +317,105 @@ export default function SceneObjectSelector({
     if (!manualMode) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     draggingRef.current = true;
-    const { x, y } = fractionFromEvent(e);
-    setDragRect({ x0: x, y0: y, x1: x, y1: y });
+    const p = fractionFromEvent(e);
+    if (drawShape === "box") {
+      setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+    } else {
+      setFreehandPoints([p]);
+    }
   }
 
   function moveManualDraw(e: PointerEvent) {
     if (!draggingRef.current) return;
-    const { x, y } = fractionFromEvent(e);
-    setDragRect((prev) => (prev ? { ...prev, x1: x, y1: y } : prev));
+    const p = fractionFromEvent(e);
+    if (drawShape === "box") {
+      setDragRect((prev) => (prev ? { ...prev, x1: p.x, y1: p.y } : prev));
+    } else {
+      setFreehandPoints((prev) => {
+        if (!prev) return prev;
+        // Skip near-duplicate points (a stationary or slow-moving pointer
+        // firing many move events) — keeps the point count, and therefore
+        // the eventual mask path, sane without a visible difference.
+        const last = prev[prev.length - 1];
+        if (
+          last &&
+          Math.abs(last.x - p.x) < 0.004 &&
+          Math.abs(last.y - p.y) < 0.004
+        ) {
+          return prev;
+        }
+        return [...prev, p];
+      });
+    }
   }
 
   function endManualDraw() {
     if (!draggingRef.current) return;
     draggingRef.current = false;
-    setDragRect((prev) => {
-      if (!prev) return null;
-      const r = normalizeRect(prev);
-      // Ignore an accidental tap/click — require a real drag.
-      if (r.right - r.left < 0.02 || r.bottom - r.top < 0.02) return null;
-      setPendingManualRect(prev);
-      setManualName("");
-      return null;
-    });
+    if (drawShape === "box") {
+      setDragRect((prev) => {
+        if (!prev) return null;
+        const r = normalizeRect(prev);
+        // Ignore an accidental tap/click — require a real drag.
+        if (r.right - r.left < 0.02 || r.bottom - r.top < 0.02) return null;
+        setPendingManualShape({ kind: "box", rect: prev });
+        setManualName("");
+        return null;
+      });
+    } else {
+      setFreehandPoints((prev) => {
+        if (!prev || prev.length < 3) return null;
+        const b = pointsBounds(prev);
+        // Same accidental-tap guard as the box tool.
+        if (b.right - b.left < 0.02 && b.bottom - b.top < 0.02) return null;
+        setPendingManualShape({ kind: "pencil", points: prev });
+        setManualName("");
+        return null;
+      });
+    }
   }
 
-  /** Rasterizes a fractional rectangle into a standalone mask image — a
-   * filled white rect on a transparent canvas, at the frame's own pixel
-   * size, so it composites with the colored-highlight CSS mask the exact
-   * same way a fal-returned mask does. */
-  function rectToMaskDataUrl(rect: DragRect): string | null {
+  /** Rasterizes a finished manual shape into a standalone mask image on a
+   * transparent canvas, at the frame's own pixel size, so it composites with
+   * the colored-highlight CSS mask the exact same way a fal-returned mask
+   * does. A box fills a rect; a pencil stroke fills the closed polygon its
+   * points trace — `closePath` connects the last point back to the first,
+   * same as the live SVG preview already shows while drawing. */
+  function shapeToMaskDataUrl(shape: ManualShape): string | null {
     if (!frameSize) return null;
-    const r = normalizeRect(rect);
     const canvas = document.createElement("canvas");
     canvas.width = frameSize.width;
     canvas.height = frameSize.height;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     ctx.fillStyle = "#ffffff";
-    ctx.fillRect(
-      r.left * frameSize.width,
-      r.top * frameSize.height,
-      (r.right - r.left) * frameSize.width,
-      (r.bottom - r.top) * frameSize.height,
-    );
+
+    if (shape.kind === "box") {
+      const r = normalizeRect(shape.rect);
+      ctx.fillRect(
+        r.left * frameSize.width,
+        r.top * frameSize.height,
+        (r.right - r.left) * frameSize.width,
+        (r.bottom - r.top) * frameSize.height,
+      );
+    } else {
+      const [first, ...rest] = shape.points;
+      ctx.beginPath();
+      ctx.moveTo(first.x * frameSize.width, first.y * frameSize.height);
+      for (const p of rest) {
+        ctx.lineTo(p.x * frameSize.width, p.y * frameSize.height);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
     return canvas.toDataURL("image/png");
   }
 
   function confirmManualSelection() {
     const name = manualName.trim();
-    if (!pendingManualRect || !name) return;
-    const maskUrl = rectToMaskDataUrl(pendingManualRect);
+    if (!pendingManualShape || !name) return;
+    const maskUrl = shapeToMaskDataUrl(pendingManualShape);
     if (!maskUrl) {
       setError("Could not create that selection — try again.");
       return;
@@ -350,7 +430,7 @@ export default function SceneObjectSelector({
         color: nextColor(prev.length),
       },
     ]);
-    setPendingManualRect(null);
+    setPendingManualShape(null);
     setManualName("");
   }
 
@@ -532,7 +612,8 @@ export default function SceneObjectSelector({
                   onPointerUp={endManualDraw}
                   onPointerCancel={endManualDraw}
                 >
-                  {dragRect &&
+                  {drawShape === "box" &&
+                    dragRect &&
                     (() => {
                       const r = normalizeRect(dragRect);
                       return (
@@ -547,6 +628,29 @@ export default function SceneObjectSelector({
                         />
                       );
                     })()}
+                  {drawShape === "pencil" && freehandPoints && (
+                    // viewBox 0 0 1 1 matches the fraction coordinates
+                    // points are stored in directly — no extra scaling math.
+                    // vector-effect keeps the stroke a constant screen width
+                    // even though the viewBox is stretched to a non-square
+                    // box for a portrait/landscape frame.
+                    <svg
+                      className="pointer-events-none absolute inset-0 h-full w-full"
+                      viewBox="0 0 1 1"
+                      preserveAspectRatio="none"
+                    >
+                      <polygon
+                        points={freehandPoints
+                          .map((p) => `${p.x},${p.y}`)
+                          .join(" ")}
+                        fill="rgba(163,230,53,0.2)"
+                        stroke="#a3e635"
+                        strokeWidth={2}
+                        vectorEffect="non-scaling-stroke"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  )}
                 </div>
               )}
             </div>
@@ -554,24 +658,61 @@ export default function SceneObjectSelector({
         )}
 
         {frameUrl && (
-          <button
-            type="button"
-            onClick={() => {
-              setManualMode((m) => !m);
-              setDragRect(null);
-              setPendingManualRect(null);
-            }}
-            className={`self-start rounded-md border px-2.5 py-1 text-[11px] font-medium transition ${
-              manualMode
-                ? "border-accent-500 bg-accent-500/15 text-accent-300"
-                : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
-            }`}
-          >
-            {manualMode ? "✓ Drawing — tap again to stop" : "✎ Draw a selection manually"}
-          </button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setManualMode((m) => !m);
+                setDragRect(null);
+                setFreehandPoints(null);
+                setPendingManualShape(null);
+              }}
+              className={`rounded-md border px-2.5 py-1 text-[11px] font-medium transition ${
+                manualMode
+                  ? "border-accent-500 bg-accent-500/15 text-accent-300"
+                  : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
+              }`}
+            >
+              {manualMode
+                ? "✓ Drawing — tap again to stop"
+                : "✎ Draw a selection manually"}
+            </button>
+            {manualMode && (
+              <div className="flex overflow-hidden rounded-md border border-ink-650">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawShape("box");
+                    setFreehandPoints(null);
+                  }}
+                  className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                    drawShape === "box"
+                      ? "bg-accent-500 text-accent-ink"
+                      : "bg-ink-850 text-ink-300 hover:text-white"
+                  }`}
+                >
+                  ▭ Box
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawShape("pencil");
+                    setDragRect(null);
+                  }}
+                  className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                    drawShape === "pencil"
+                      ? "bg-accent-500 text-accent-ink"
+                      : "bg-ink-850 text-ink-300 hover:text-white"
+                  }`}
+                >
+                  ✎ Pencil
+                </button>
+              </div>
+            )}
+          </div>
         )}
 
-        {pendingManualRect && (
+        {pendingManualShape && (
           <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
             <input
               type="text"
@@ -581,7 +722,7 @@ export default function SceneObjectSelector({
               onKeyDown={(e) => {
                 if (e.key === "Enter") confirmManualSelection();
                 if (e.key === "Escape") {
-                  setPendingManualRect(null);
+                  setPendingManualShape(null);
                   setManualName("");
                 }
               }}
@@ -599,7 +740,7 @@ export default function SceneObjectSelector({
             <button
               type="button"
               onClick={() => {
-                setPendingManualRect(null);
+                setPendingManualShape(null);
                 setManualName("");
               }}
               className="shrink-0 text-xs text-ink-400 hover:text-white"
