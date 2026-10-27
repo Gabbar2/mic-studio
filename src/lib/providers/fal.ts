@@ -378,9 +378,95 @@ async function createWan30(p: CreateVideoParams): Promise<ProviderTask> {
 const SAM_SUBMIT_PATH = "fal-ai/sam-3/image";
 const SAM_APP = "fal-ai/sam-3";
 
+/**
+ * Direct (non-queue) fal host. Most of this file's models are billed/slow
+ * enough that fal only exposes them through the queue (submit → poll →
+ * fetch) — SAM 3 included. Florence-2's object-detection task is small and
+ * fast enough that fal exposes it as a plain synchronous POST on this host
+ * instead, per its own docs' curl example; same `Authorization: Key …`
+ * header as everything else here, just a different base URL and no
+ * request_id/polling dance.
+ */
+const DIRECT = "https://fal.run";
+
 interface SamResult {
   masks?: { url: string; width?: number; height?: number }[];
   scores?: number[];
+}
+
+interface Florence2DetectionResult {
+  results?: { bboxes?: Array<{ label?: unknown }> };
+}
+
+/**
+ * Lists candidate object/background labels found in `imageUrl`, via
+ * Florence-2's object-detection task — the auto-detect pills shown above the
+ * frame in the Reference Editor's select-objects step, so a person isn't
+ * stuck typing every description by hand.
+ *
+ * Only the `label` string off each returned box is used. Florence-2 also
+ * returns a bounding box per label, but this app re-segments with SAM 3 by
+ * name when a pill is clicked (same call `segmentByPrompt` makes for a typed
+ * description) rather than trusting Florence-2's own box as the mask, so
+ * those coordinates — whose exact field shape fal's docs don't fully
+ * spell out — are never read here at all; only `label`, which the docs do
+ * confirm.
+ *
+ * Best-effort: the caller treats a thrown error here as "no auto-suggestions
+ * available" and falls back to manual typing, never as blocking the rest of
+ * the selector.
+ */
+export async function detectCandidateLabels(imageUrl: string): Promise<string[]> {
+  const key = process.env.FAL_KEY;
+  if (!key) {
+    throw new ProviderError(
+      "FAL_KEY is not set. Create one at https://fal.ai/dashboard/keys.",
+      "fal",
+    );
+  }
+
+  const res = await fetch(`${DIRECT}/fal-ai/florence-2-large/object-detection`, {
+    method: "POST",
+    headers: {
+      Authorization: `Key ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ image_url: imageUrl }),
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let json: Florence2DetectionResult;
+  try {
+    json = JSON.parse(text) as Florence2DetectionResult;
+  } catch {
+    throw new ProviderError(
+      `fal returned non-JSON (HTTP ${res.status}): ${text.slice(0, 300)}`,
+      "fal",
+      res.status,
+    );
+  }
+
+  if (!res.ok) {
+    throw new ProviderError(
+      errorText(json as { error?: string; detail?: unknown; message?: string }),
+      "fal",
+      res.status,
+    );
+  }
+
+  const seen = new Set<string>();
+  const labels: string[] = [];
+  for (const box of json.results?.bboxes ?? []) {
+    const label = typeof box.label === "string" ? box.label.trim() : "";
+    if (!label) continue;
+    const key2 = label.toLowerCase();
+    if (seen.has(key2)) continue;
+    seen.add(key2);
+    labels.push(label);
+    if (labels.length >= 12) break;
+  }
+  return labels;
 }
 
 export interface SegmentResult {
