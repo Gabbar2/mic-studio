@@ -8,12 +8,28 @@ interface Selection {
   id: string;
   name: string;
   maskUrl: string;
+  color: string;
 }
 
 interface PendingMask {
   maskUrl: string;
   name: string;
 }
+
+/**
+ * Distinct, colorblind-friendlyish hues so several kept selections read as
+ * separate highlights at a glance rather than one blob. Cycles if there are
+ * more selections than colors — unlikely for a handful of kept objects per
+ * clip, and a repeat is harmless (the name label still disambiguates).
+ */
+const HIGHLIGHT_COLORS = [
+  "#22d3ee", // cyan
+  "#f472b6", // pink
+  "#facc15", // yellow
+  "#a78bfa", // violet
+  "#fb923c", // orange
+  "#4ade80", // green
+];
 
 /**
  * Describe-to-select object/background selection for one prepared scene
@@ -153,7 +169,12 @@ export default function SceneObjectSelector({
     nameSeq.current += 1;
     setSelections((prev) => [
       ...prev,
-      { id: `sel-${nameSeq.current}`, name: pending.name, maskUrl: pending.maskUrl },
+      {
+        id: `sel-${nameSeq.current}`,
+        name: pending.name,
+        maskUrl: pending.maskUrl,
+        color: HIGHLIGHT_COLORS[prev.length % HIGHLIGHT_COLORS.length],
+      },
     ]);
     setPending(null);
     setDescribeText("");
@@ -163,20 +184,32 @@ export default function SceneObjectSelector({
     setSelections((prev) => prev.filter((s) => s.id !== id));
   }
 
+  // Wrapped defensively: onSave ultimately runs the parent's state update
+  // and closes this modal, so if anything in that chain throws, the only
+  // sign would otherwise be the modal silently staying open with the click
+  // appearing to do nothing — worth surfacing instead of swallowing.
   function handleDone() {
-    if (selections.length === 0) {
-      onClose();
-      return;
+    try {
+      if (selections.length === 0) {
+        onClose();
+        return;
+      }
+      const names = selections.map((s) => s.name);
+      const keepLine =
+        names.length === 1
+          ? `Keep "${names[0]}" unchanged throughout.`
+          : `Keep these unchanged throughout: ${names.map((n) => `"${n}"`).join(", ")}.`;
+      const prompt = initialPrompt
+        ? `${keepLine} ${initialPrompt}`
+        : `${keepLine} Describe what happens to the rest of the scene here.`;
+      onSave(prompt);
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? `Could not save: ${e.message}`
+          : "Could not save these selections — try again.",
+      );
     }
-    const names = selections.map((s) => s.name);
-    const keepLine =
-      names.length === 1
-        ? `Keep "${names[0]}" unchanged throughout.`
-        : `Keep these unchanged throughout: ${names.map((n) => `"${n}"`).join(", ")}.`;
-    const prompt = initialPrompt
-      ? `${keepLine} ${initialPrompt}`
-      : `${keepLine} Describe what happens to the rest of the scene here.`;
-    onSave(prompt);
   }
 
   return (
@@ -197,8 +230,10 @@ export default function SceneObjectSelector({
         <p className="text-[11px] leading-relaxed text-ink-400">
           Describe a person, object, or background in the frame below — e.g.
           &quot;the red jacket&quot; or &quot;the background wall&quot; —
-          then press Detect. Keep the ones you want preserved; they get
-          listed in the prompt so the model doesn&apos;t blend them away.
+          then press Detect. Keep the ones you want preserved; each stays
+          highlighted in its own color so you can see everything you&apos;ve
+          kept at once, and gets listed in the prompt so the model
+          doesn&apos;t blend it away.
         </p>
 
         {loadingFrame && (
@@ -215,12 +250,40 @@ export default function SceneObjectSelector({
               alt=""
               className="max-h-[45vh] w-auto max-w-full object-contain"
             />
+            {/*
+             * Every kept selection stays highlighted on the frame, not just
+             * the one currently being detected — this is the closest this
+             * text-concept model can get to a true hover/long-press
+             * highlight (SAM 3 has no cheap per-pixel "what's under the
+             * cursor" query; each highlight here is the result of an actual
+             * billed detection call, not a live probe). Tinted with
+             * mask-image/background-color rather than mix-blend-screen so
+             * several selections read as distinct colors instead of
+             * stacking into one white blob.
+             */}
+            {selections.map((s) => (
+              <div
+                key={s.id}
+                className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
+                style={{
+                  backgroundColor: s.color,
+                  WebkitMaskImage: `url(${s.maskUrl})`,
+                  maskImage: `url(${s.maskUrl})`,
+                  WebkitMaskSize: "contain",
+                  maskSize: "contain",
+                  WebkitMaskRepeat: "no-repeat",
+                  maskRepeat: "no-repeat",
+                  WebkitMaskPosition: "center",
+                  maskPosition: "center",
+                }}
+              />
+            ))}
             {pending && (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={pending.maskUrl}
                 alt=""
-                className="pointer-events-none absolute inset-0 h-full w-full object-contain opacity-60 mix-blend-screen"
+                className="pointer-events-none absolute inset-0 h-full w-full animate-pulse object-contain opacity-70 mix-blend-screen"
               />
             )}
             {segmenting && (
@@ -293,7 +356,14 @@ export default function SceneObjectSelector({
                 key={s.id}
                 className="flex items-center justify-between gap-2 rounded-lg border border-ink-650 bg-ink-850 px-3 py-1.5 text-xs text-ink-200"
               >
-                <span className="truncate">{s.name}</span>
+                <span className="flex min-w-0 items-center gap-2">
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: s.color }}
+                    aria-hidden
+                  />
+                  <span className="truncate">{s.name}</span>
+                </span>
                 <button
                   type="button"
                   onClick={() => removeSelection(s.id)}
