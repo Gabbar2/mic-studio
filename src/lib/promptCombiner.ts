@@ -71,6 +71,17 @@ export interface ElementRecord {
   rawPrompt: string;
   optimizedPrompt: string;
   attachments: ElementAttachment[];
+  /**
+   * The actual edited frame from the ✨ chat's real (or mock) OpenAI call —
+   * the whole clip frame with just this element regenerated per its
+   * instruction, everything else held unchanged by the edit mask. Null
+   * until at least one "Send" in that chat has completed. When present,
+   * this — not `attachments` — is what buildCombinedPrompt sends to Mic
+   * Studio for this element: it's the finished result, not reference
+   * material for a result that hasn't happened yet. See the doc comment on
+   * buildCombinedPrompt below.
+   */
+  generatedImageUrl: string | null;
   status: ElementStatus;
   createdAt: string;
   updatedAt: string;
@@ -123,6 +134,20 @@ export interface Dataset2 {
  * *completed* elements — the caller (the Done button's confirmation flow)
  * is responsible for deciding what happens to elements still missing an
  * instruction; this function never invents one.
+ *
+ * Per element, what becomes "Image N" in the combined prompt and in
+ * `attachments` (and therefore in Mic Studio's own image-reference slots —
+ * see the Dataset2 doc comment above) depends on whether that element has
+ * gone through the ✨ chat's real edit yet:
+ *  - `generatedImageUrl` set: that one finished, already-edited frame *is*
+ *    this element's entry — the point of generating it was for this exact
+ *    image to be what Mic Studio receives, not a picture of what to aim
+ *    for.
+ *  - `generatedImageUrl` still null (nobody has pressed Send yet, or this
+ *    clip predates the AI-edit feature): falls back to whatever reference
+ *    images were manually attached, same as before this feature existed —
+ *    so an element with only a written instruction and no generated result
+ *    still folds in cleanly rather than contributing nothing.
  */
 export function buildCombinedPrompt(elements: ElementRecord[]): Dataset2 {
   const attachments: Dataset2AttachmentRef[] = [];
@@ -132,7 +157,22 @@ export function buildCombinedPrompt(elements: ElementRecord[]): Dataset2 {
 
   elements.forEach((el, i) => {
     const nums: number[] = [];
-    for (const a of el.attachments) {
+    const images: { attachmentId: string; url: string; type: "image" }[] =
+      el.generatedImageUrl
+        ? [
+            {
+              attachmentId: `generated_${el.elementId}`,
+              url: el.generatedImageUrl,
+              type: "image",
+            },
+          ]
+        : el.attachments.map((a) => ({
+            attachmentId: a.attachmentId,
+            url: a.url,
+            type: "image" as const,
+          }));
+
+    for (const a of images) {
       refCounter += 1;
       attachments.push({
         referenceNumber: refCounter,
