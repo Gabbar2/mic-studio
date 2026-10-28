@@ -16,6 +16,7 @@ import {
   writeReferenceTransfer,
   type ReferenceTransferJob,
 } from "@/lib/referenceTransfer";
+import type { ElementRecord } from "@/lib/promptCombiner";
 import {
   MODELS,
   getModel,
@@ -56,6 +57,14 @@ interface PreparedClip {
   start: number;
   end: number;
   thumbnail: string | null;
+  /**
+   * Dataset 1 for this clip's multi-element editing — lives here, not as
+   * local state inside SceneObjectSelector, specifically so it survives
+   * that modal unmounting when the user closes and reopens it for the same
+   * clip. In-memory only (no backing table): cleared on a full page reload,
+   * same lifetime as everything else in this editor.
+   */
+  elements: ElementRecord[];
 }
 
 export default function ReferenceEditor() {
@@ -245,7 +254,13 @@ function ReferenceEditorInner() {
           (seg.start + seg.end) / 2,
         );
 
-        newClips.push({ job, start: seg.start, end: seg.end, thumbnail });
+        newClips.push({
+          job,
+          start: seg.start,
+          end: seg.end,
+          thumbnail,
+          elements: [],
+        });
         // Shown as each one finishes rather than all at once at the end —
         // there can now be several scenes, and watching them land one by
         // one is a better signal of real progress than a single spinner
@@ -273,13 +288,41 @@ function ReferenceEditorInner() {
 
   const selectorClip = clips.find((c) => c.job.id === selectorClipId) ?? null;
 
-  function savePromptForClip(clipId: string, prompt: string) {
+  function savePromptForClip(
+    clipId: string,
+    result: { prompt: string; referenceImageUrls: string[] },
+  ) {
     setClips((prev) =>
       prev.map((c) =>
-        c.job.id === clipId ? { ...c, job: { ...c.job, prompt } } : c,
+        c.job.id === clipId
+          ? {
+              ...c,
+              job: {
+                ...c.job,
+                prompt: result.prompt,
+                referenceImageUrls: result.referenceImageUrls,
+              },
+            }
+          : c,
       ),
     );
     setSelectorClipId(null);
+  }
+
+  /** Dataset 1 updater for whichever clip's selector is currently open —
+   * passed down as SceneObjectSelector's `onElementsChange` so that
+   * component can treat its element list as a normal piece of state (via
+   * the updater-function form of setState) without knowing it's actually
+   * stored per-clip up here. */
+  function setClipElements(
+    clipId: string,
+    updater: (prev: ElementRecord[]) => ElementRecord[],
+  ) {
+    setClips((prev) =>
+      prev.map((c) =>
+        c.job.id === clipId ? { ...c, elements: updater(c.elements) } : c,
+      ),
+    );
   }
 
   function continueInStudio() {
@@ -627,9 +670,10 @@ function ReferenceEditorInner() {
       {/* --- Coming next ----------------------------------------------- */}
       <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
         <span className="font-medium text-ink-200">Coming next:</span>{" "}
-        real ChatGPT-drafted editing prompts per selected element — for now,
-        naming a selection builds a short starter prompt listing it, which
-        you can edit further once you land in Mic Studio.
+        real ChatGPT-based prompt optimization per element — each
+        element&apos;s instruction is used exactly as typed for now, combined
+        into one prompt once you press Done, which you can still edit further
+        once you land in Mic Studio.
       </div>
 
       {selectorClip && meta && (
@@ -639,10 +683,13 @@ function ReferenceEditorInner() {
           sourceHeight={meta.height}
           clipStart={selectorClip.start}
           clipEnd={selectorClip.end}
-          initialPrompt={selectorClip.job.prompt}
+          elements={selectorClip.elements}
+          onElementsChange={(updater) =>
+            setClipElements(selectorClip.job.id, updater)
+          }
           granted={granted}
           onClose={() => setSelectorClipId(null)}
-          onSave={(prompt) => savePromptForClip(selectorClip.job.id, prompt)}
+          onSave={(result) => savePromptForClip(selectorClip.job.id, result)}
         />
       )}
     </div>
