@@ -48,6 +48,19 @@ type ManualShape =
   | { kind: "box"; rect: DragRect }
   | { kind: "pencil"; points: Point[] };
 
+/** One bubble in a per-element edit chat — either the person's own typed
+ * instruction, or the actual edited frame that came back for it (real or
+ * mock; `mock` is only set on a freshly-generated result, never on one
+ * reconstructed from a reopened element — see openEditor). */
+type EditorMessage =
+  | { id: string; role: "user"; text: string }
+  | { id: string; role: "result"; imageUrl: string; mock?: boolean }
+  // A system-style note (e.g. "↻ regenerated the selection") — shown in the
+  // thread for context but never counted as an instruction: excluded from
+  // the text saveEditor folds into rawPrompt, and from what regenerateSelection
+  // treats as "the last thing typed".
+  | { id: string; role: "note"; text: string };
+
 /** Bounding box of a freehand stroke, in the same shape normalizeRect
  * returns, so both shapes can share one minimum-size check. */
 function pointsBounds(points: Point[]) {
@@ -184,9 +197,7 @@ export default function SceneObjectSelector({
     null,
   );
   const [draftLabel, setDraftLabel] = useState("");
-  const [draftMessages, setDraftMessages] = useState<
-    { id: string; text: string }[]
-  >([]);
+  const [draftMessages, setDraftMessages] = useState<EditorMessage[]>([]);
   const [composeText, setComposeText] = useState("");
   const [draftAttachments, setDraftAttachments] = useState<
     ElementAttachment[]
@@ -194,6 +205,15 @@ export default function SceneObjectSelector({
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [regenerating, setRegenerating] = useState(false);
+  // The most recent actual edited frame from this chat (real or mock) —
+  // what Save writes onto the element as `generatedImageUrl`. Separate from
+  // `draftMessages` (which is just the thread for display) so Save doesn't
+  // have to go hunting backward through the thread for the last result
+  // bubble.
+  const [lastGeneratedUrl, setLastGeneratedUrl] = useState<string | null>(
+    null,
+  );
+  const [generating, setGenerating] = useState(false);
   const messageSeq = useRef(0);
   const editingElement =
     elements.find((e) => e.elementId === editingElementId) ?? null;
@@ -320,6 +340,7 @@ export default function SceneObjectSelector({
         rawPrompt: "",
         optimizedPrompt: "",
         attachments: [],
+        generatedImageUrl: null,
         status: "not_started",
         createdAt: now,
         updatedAt: now,
@@ -548,12 +569,22 @@ export default function SceneObjectSelector({
   function openEditor(el: ElementRecord) {
     setEditingElementId(el.elementId);
     setDraftLabel(el.label);
-    // A previously saved instruction reopens as one message already in the
-    // thread — "opens similarly with the attached image in the chat" means
-    // the conversation picks back up where it left off, not a blank box.
-    setDraftMessages(el.rawPrompt ? [{ id: "seed", text: el.rawPrompt }] : []);
+    // A previously saved instruction — and its generated result, if this
+    // element has one — reopens already in the thread, so coming back to an
+    // element picks the conversation back up instead of starting over.
+    const seeded: EditorMessage[] = [];
+    if (el.rawPrompt) seeded.push({ id: "seed-user", role: "user", text: el.rawPrompt });
+    if (el.generatedImageUrl) {
+      seeded.push({
+        id: "seed-result",
+        role: "result",
+        imageUrl: el.generatedImageUrl,
+      });
+    }
+    setDraftMessages(seeded);
     setComposeText("");
     setDraftAttachments(el.attachments);
+    setLastGeneratedUrl(el.generatedImageUrl);
     setEditorError(null);
   }
 
@@ -569,19 +600,69 @@ export default function SceneObjectSelector({
     removeElement(editingElementId);
   }
 
-  /** Appends whatever's typed as its own bubble in the thread — this is the
-   * "edit" half of edit/remove/regenerate. Nothing is saved to the element
-   * yet; Save folds every bubble (plus anything still sitting in the
-   * composer) into one instruction. */
-  function sendComposedMessage() {
+  /**
+   * Sends what's typed as a user bubble, then actually generates this
+   * element's edited frame from it via /api/edit-element — the real "edit"
+   * in edit/remove/regenerate. That route itself decides mock vs. real
+   * (the admin switch on /admin; see lib/elementEditSettings.ts), so this
+   * component never needs to know which one is active — it just renders
+   * whatever comes back, labeled if it was a mock run.
+   *
+   * Nothing is written onto the element itself until Save — this only
+   * updates the thread (`draftMessages`) and `lastGeneratedUrl`, so Cancel
+   * still discards everything cleanly, same as before this call existed.
+   */
+  async function sendComposedMessage() {
     const text = composeText.trim();
-    if (!text) return;
+    if (!text || generating || !editingElement || !frameUrl) return;
+
     messageSeq.current += 1;
-    setDraftMessages((prev) => [
-      ...prev,
-      { id: `msg_${messageSeq.current}`, text },
-    ]);
+    const userMessage: EditorMessage = {
+      id: `msg_${messageSeq.current}`,
+      role: "user",
+      text,
+    };
+    setDraftMessages((prev) => [...prev, userMessage]);
     setComposeText("");
+    setGenerating(true);
+    setEditorError(null);
+
+    try {
+      const res = await fetch("/api/edit-element", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageUrl: frameUrl,
+          maskUrl: editingElement.maskUrl,
+          prompt: text,
+        }),
+      });
+      const json = (await res.json()) as {
+        url?: string;
+        mock?: boolean;
+        error?: string;
+      };
+      if (!res.ok || !json.url) {
+        throw new Error(json.error ?? "Could not generate that edit.");
+      }
+      messageSeq.current += 1;
+      setDraftMessages((prev) => [
+        ...prev,
+        {
+          id: `msg_${messageSeq.current}`,
+          role: "result",
+          imageUrl: json.url!,
+          mock: !!json.mock,
+        },
+      ]);
+      setLastGeneratedUrl(json.url);
+    } catch (e) {
+      setEditorError(
+        e instanceof Error ? e.message : "Could not generate that edit.",
+      );
+    } finally {
+      setGenerating(false);
+    }
   }
 
   /** Re-runs detection for this one element using whatever's been typed
@@ -592,11 +673,12 @@ export default function SceneObjectSelector({
    * the new region without starting a new element. */
   async function regenerateSelection() {
     if (!editingElementId || !frameUrl || regenerating) return;
-    const prompt = (
-      composeText.trim() ||
-      draftMessages[draftMessages.length - 1]?.text ||
-      draftLabel
-    ).trim();
+    const lastUserText = [...draftMessages]
+      .reverse()
+      .find((m): m is Extract<EditorMessage, { role: "user" }> =>
+        m.role === "user",
+      )?.text;
+    const prompt = (composeText.trim() || lastUserText || draftLabel).trim();
     if (!prompt) {
       setEditorError("Type what to select before regenerating.");
       return;
@@ -638,6 +720,7 @@ export default function SceneObjectSelector({
         ...prev,
         {
           id: `msg_${messageSeq.current}`,
+          role: "note",
           text: `↻ Regenerated the highlighted selection for "${prompt}".`,
         },
       ]);
@@ -701,12 +784,19 @@ export default function SceneObjectSelector({
 
   function saveEditor() {
     if (!editingElementId) return;
-    // Folds every sent bubble, plus anything still sitting unsent in the
-    // composer (so a typed-but-not-"sent" line isn't silently dropped),
-    // into one instruction — in the order they were written, which is also
-    // the order buildCombinedPrompt will read them in once this element is
-    // folded into the combined prompt.
-    const prompt = [...draftMessages.map((m) => m.text), composeText.trim()]
+    // Folds every sent *instruction* bubble, plus anything still sitting
+    // unsent in the composer (so a typed-but-not-"sent" line isn't silently
+    // dropped), into one instruction — in the order they were written.
+    // Result bubbles aren't text, so they're skipped here; the latest one's
+    // image is what `generatedImageUrl` below carries forward instead.
+    const prompt = [
+      ...draftMessages
+        .filter((m): m is Extract<EditorMessage, { role: "user" }> =>
+          m.role === "user",
+        )
+        .map((m) => m.text),
+      composeText.trim(),
+    ]
       .filter((t) => t.length > 0)
       .join("\n\n");
     if (!prompt) {
@@ -725,6 +815,7 @@ export default function SceneObjectSelector({
               // Pass-through — see lib/promptCombiner.ts's doc comment.
               optimizedPrompt: prompt,
               attachments: draftAttachments,
+              generatedImageUrl: lastGeneratedUrl,
               status: "completed",
               updatedAt: now,
             }
@@ -1264,13 +1355,55 @@ export default function SceneObjectSelector({
                     </div>
                   )}
 
-                  {draftMessages.map((m) => (
-                    <div key={m.id} className="flex justify-end">
-                      <div className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-tr-sm bg-accent-500/15 px-3 py-2 text-xs text-white">
-                        {m.text}
+                  {draftMessages.map((m) => {
+                    if (m.role === "user") {
+                      return (
+                        <div key={m.id} className="flex justify-end">
+                          <div className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-tr-sm bg-accent-500/15 px-3 py-2 text-xs text-white">
+                            {m.text}
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (m.role === "note") {
+                      return (
+                        <p
+                          key={m.id}
+                          className="text-center text-[10px] text-ink-500"
+                        >
+                          {m.text}
+                        </p>
+                      );
+                    }
+                    // role === "result" — the actual edited frame, shown
+                    // left-aligned like a reply, the way the thread tells
+                    // apart "what I asked for" from "what came back".
+                    return (
+                      <div key={m.id} className="flex justify-start">
+                        <div className="max-w-[85%] overflow-hidden rounded-xl rounded-tl-sm border border-ink-650 bg-ink-850">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={m.imageUrl}
+                            alt=""
+                            className="block max-h-56 w-auto max-w-full object-contain"
+                          />
+                          <p className="px-2.5 py-1.5 text-[10px] text-ink-400">
+                            {m.mock
+                              ? "Mock result — no real edit applied"
+                              : "Generated"}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {generating && (
+                    <div className="flex justify-start">
+                      <div className="rounded-xl rounded-tl-sm border border-ink-650 bg-ink-850 px-3 py-2 text-xs text-ink-400">
+                        Generating…
                       </div>
                     </div>
-                  ))}
+                  )}
 
                   {draftAttachments.length > 0 && (
                     <div className="flex justify-end">
@@ -1337,19 +1470,23 @@ export default function SceneObjectSelector({
                     </label>
                     <button
                       type="button"
-                      onClick={sendComposedMessage}
-                      disabled={!composeText.trim()}
+                      onClick={() => void sendComposedMessage()}
+                      disabled={!composeText.trim() || generating}
                       className="rounded-md bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
                     >
-                      Send
+                      {generating ? "…" : "Send"}
                     </button>
                   </div>
                 </div>
                 <p className="-mt-1.5 text-[10px] text-ink-500">
-                  Enter to send, Shift+Enter for a new line. 📎 attaches
-                  reference images that travel with this element to Mic
-                  Studio; ↻ regenerates the highlighted selection itself
-                  using what you&apos;ve typed.
+                  Enter to send, Shift+Enter for a new line. Send actually
+                  generates this element&apos;s edited frame — everything
+                  outside the highlight stays untouched, and the result
+                  (labeled Mock if mock mode is on) becomes what reaches Mic
+                  Studio for this element. ↻ instead moves the highlighted
+                  area itself, without generating anything. 📎 attaches extra
+                  reference images, described in your own words for now
+                  rather than sent to the model directly.
                 </p>
 
                 {editorError && (
