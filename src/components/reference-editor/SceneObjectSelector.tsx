@@ -172,18 +172,29 @@ export default function SceneObjectSelector({
   const [manualName, setManualName] = useState("");
   const draggingRef = useRef(false);
 
-  // Per-element editor — opened by the ✨ icon on a list row. Drafted
-  // separately from `elements` so Cancel can discard changes cleanly.
+  // Per-element editor — opened by the ✨ icon on a list row, styled as a
+  // small chat so writing, re-reading, and revising an instruction feels
+  // like a running conversation about this one element rather than a
+  // single-shot form. Drafted separately from `elements` so Cancel can
+  // discard changes cleanly. There's no model replying in this thread (see
+  // lib/promptCombiner.ts's pass-through note) — every bubble here is the
+  // person's own message; "sending" one just appends it to the instruction
+  // text that gets saved.
   const [editingElementId, setEditingElementId] = useState<string | null>(
     null,
   );
   const [draftLabel, setDraftLabel] = useState("");
-  const [draftPrompt, setDraftPrompt] = useState("");
+  const [draftMessages, setDraftMessages] = useState<
+    { id: string; text: string }[]
+  >([]);
+  const [composeText, setComposeText] = useState("");
   const [draftAttachments, setDraftAttachments] = useState<
     ElementAttachment[]
   >([]);
   const [attachmentUploading, setAttachmentUploading] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
+  const messageSeq = useRef(0);
   const editingElement =
     elements.find((e) => e.elementId === editingElementId) ?? null;
 
@@ -537,7 +548,11 @@ export default function SceneObjectSelector({
   function openEditor(el: ElementRecord) {
     setEditingElementId(el.elementId);
     setDraftLabel(el.label);
-    setDraftPrompt(el.rawPrompt);
+    // A previously saved instruction reopens as one message already in the
+    // thread — "opens similarly with the attached image in the chat" means
+    // the conversation picks back up where it left off, not a blank box.
+    setDraftMessages(el.rawPrompt ? [{ id: "seed", text: el.rawPrompt }] : []);
+    setComposeText("");
     setDraftAttachments(el.attachments);
     setEditorError(null);
   }
@@ -545,6 +560,96 @@ export default function SceneObjectSelector({
   function closeEditor() {
     setEditingElementId(null);
     setEditorError(null);
+  }
+
+  function removeEditingElement() {
+    if (!editingElementId) return;
+    // removeElement already clears editingElementId when it matches, which
+    // also closes this overlay — one path for "remove" everywhere.
+    removeElement(editingElementId);
+  }
+
+  /** Appends whatever's typed as its own bubble in the thread — this is the
+   * "edit" half of edit/remove/regenerate. Nothing is saved to the element
+   * yet; Save folds every bubble (plus anything still sitting in the
+   * composer) into one instruction. */
+  function sendComposedMessage() {
+    const text = composeText.trim();
+    if (!text) return;
+    messageSeq.current += 1;
+    setDraftMessages((prev) => [
+      ...prev,
+      { id: `msg_${messageSeq.current}`, text },
+    ]);
+    setComposeText("");
+  }
+
+  /** Re-runs detection for this one element using whatever's been typed
+   * (composer first, else the latest sent message, else the label) as the
+   * new description — the "regenerate the highlighted element" half of the
+   * request. Updates the element's own mask in place, so its highlight
+   * (here and back on the main frame) and its saved selection both move to
+   * the new region without starting a new element. */
+  async function regenerateSelection() {
+    if (!editingElementId || !frameUrl || regenerating) return;
+    const prompt = (
+      composeText.trim() ||
+      draftMessages[draftMessages.length - 1]?.text ||
+      draftLabel
+    ).trim();
+    if (!prompt) {
+      setEditorError("Type what to select before regenerating.");
+      return;
+    }
+    setRegenerating(true);
+    setEditorError(null);
+    try {
+      const res = await fetch("/api/segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: frameUrl, prompt }),
+      });
+      const json = (await res.json()) as {
+        maskUrl?: string;
+        score?: number;
+        error?: string;
+      };
+      if (!res.ok || !json.maskUrl) {
+        throw new Error(json.error ?? "Could not regenerate that selection.");
+      }
+      const maskUrl = json.maskUrl;
+      const now = new Date().toISOString();
+      onElementsChange((prev) =>
+        prev.map((e) =>
+          e.elementId === editingElementId
+            ? {
+                ...e,
+                maskUrl,
+                highlightPreviewUrl: maskUrl,
+                detectionConfidence:
+                  typeof json.score === "number" ? json.score : null,
+                updatedAt: now,
+              }
+            : e,
+        ),
+      );
+      messageSeq.current += 1;
+      setDraftMessages((prev) => [
+        ...prev,
+        {
+          id: `msg_${messageSeq.current}`,
+          text: `↻ Regenerated the highlighted selection for "${prompt}".`,
+        },
+      ]);
+    } catch (e) {
+      setEditorError(
+        e instanceof Error
+          ? e.message
+          : "Could not regenerate that selection.",
+      );
+    } finally {
+      setRegenerating(false);
+    }
   }
 
   /**
@@ -596,9 +701,16 @@ export default function SceneObjectSelector({
 
   function saveEditor() {
     if (!editingElementId) return;
-    const prompt = draftPrompt.trim();
+    // Folds every sent bubble, plus anything still sitting unsent in the
+    // composer (so a typed-but-not-"sent" line isn't silently dropped),
+    // into one instruction — in the order they were written, which is also
+    // the order buildCombinedPrompt will read them in once this element is
+    // folded into the combined prompt.
+    const prompt = [...draftMessages.map((m) => m.text), composeText.trim()]
+      .filter((t) => t.length > 0)
+      .join("\n\n");
     if (!prompt) {
-      setEditorError("Enter an editing instruction before saving.");
+      setEditorError("Write at least one message before saving.");
       return;
     }
     const label = draftLabel.trim() || editingElement?.label || "Untitled";
@@ -1063,149 +1175,210 @@ export default function SceneObjectSelector({
         </div>
       </div>
 
-      {editingElement && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4">
-          <div className="flex max-h-[90vh] w-full max-w-md flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white">
-                Edit instruction
-              </h3>
-              <button
-                type="button"
-                onClick={closeEditor}
-                className="text-[11px] text-ink-400 hover:text-white"
-              >
-                Close
-              </button>
-            </div>
+      {editingElement &&
+        (() => {
+          const hasContent =
+            draftMessages.length > 0 || composeText.trim().length > 0;
+          return (
+            <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4">
+              <div className="flex max-h-[90vh] w-full max-w-md flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <input
+                    type="text"
+                    value={draftLabel}
+                    onChange={(e) => setDraftLabel(e.target.value)}
+                    placeholder="Label"
+                    aria-label="Element label"
+                    className="min-w-0 flex-1 truncate rounded-md border border-transparent bg-transparent px-1 py-1 text-sm font-semibold text-white outline-none focus:border-ink-650 focus:bg-ink-850"
+                  />
+                  <div className="flex shrink-0 items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void regenerateSelection()}
+                      disabled={regenerating}
+                      title="Regenerate this selection"
+                      aria-label="Regenerate this selection"
+                      className="text-ink-400 hover:text-white disabled:cursor-wait disabled:opacity-50"
+                    >
+                      {regenerating ? "…" : "↻"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={removeEditingElement}
+                      title="Remove this element"
+                      aria-label="Remove this element"
+                      className="text-ink-400 hover:text-red-400"
+                    >
+                      🗑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={closeEditor}
+                      className="text-[11px] text-ink-400 hover:text-white"
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
 
-            {frameDataUrl && (
-              <div className="relative flex max-h-[28vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
-                <div className="relative inline-block">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={frameDataUrl}
-                    alt=""
-                    className="block max-h-[28vh] w-auto max-w-full object-contain"
-                  />
-                  <div
-                    className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
-                    style={{
-                      backgroundColor: editingElement.color,
-                      WebkitMaskImage: `url(${editingElement.maskUrl})`,
-                      maskImage: `url(${editingElement.maskUrl})`,
-                      WebkitMaskSize: "contain",
-                      maskSize: "contain",
-                      WebkitMaskRepeat: "no-repeat",
-                      maskRepeat: "no-repeat",
-                      WebkitMaskPosition: "center",
-                      maskPosition: "center",
+                {/*
+                 * A running chat about this one element: it opens with the
+                 * highlighted crop already "attached" as the first bubble
+                 * (exactly what's selected, shown the way it'd look pinned
+                 * in a ChatGPT-style thread), then every instruction typed
+                 * — past and new — appears below it as its own message.
+                 * There's no reply bubble because nothing here calls a
+                 * model yet (see lib/promptCombiner.ts); regenerating or
+                 * saving both read straight out of this same thread.
+                 */}
+                <div className="flex max-h-[42vh] flex-col gap-2 overflow-y-auto rounded-lg border border-ink-650 bg-black/40 p-2.5">
+                  {frameDataUrl && (
+                    <div className="flex justify-end">
+                      <div className="max-w-[85%] overflow-hidden rounded-xl rounded-tr-sm border border-ink-650 bg-ink-850">
+                        <div className="relative flex max-h-56 items-center justify-center bg-black">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={frameDataUrl}
+                            alt=""
+                            className="block max-h-56 w-auto max-w-full object-contain"
+                          />
+                          <div
+                            className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
+                            style={{
+                              backgroundColor: editingElement.color,
+                              WebkitMaskImage: `url(${editingElement.maskUrl})`,
+                              maskImage: `url(${editingElement.maskUrl})`,
+                              WebkitMaskSize: "contain",
+                              maskSize: "contain",
+                              WebkitMaskRepeat: "no-repeat",
+                              maskRepeat: "no-repeat",
+                              WebkitMaskPosition: "center",
+                              maskPosition: "center",
+                            }}
+                          />
+                        </div>
+                        <p className="px-2.5 py-1.5 text-[10px] text-ink-400">
+                          Attached — the highlighted selection
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {draftMessages.map((m) => (
+                    <div key={m.id} className="flex justify-end">
+                      <div className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-tr-sm bg-accent-500/15 px-3 py-2 text-xs text-white">
+                        {m.text}
+                      </div>
+                    </div>
+                  ))}
+
+                  {draftAttachments.length > 0 && (
+                    <div className="flex justify-end">
+                      <ul className="flex max-w-[85%] flex-wrap justify-end gap-2">
+                        {draftAttachments.map((a) => (
+                          <li
+                            key={a.attachmentId}
+                            className="relative h-14 w-14 overflow-hidden rounded-md border border-ink-650 bg-ink-850"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={a.thumbnail}
+                              alt=""
+                              className="h-full w-full object-cover"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                removeDraftAttachment(a.attachmentId)
+                              }
+                              className="absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-[10px] text-white hover:bg-black"
+                              aria-label="Remove attachment"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-end gap-2">
+                  <textarea
+                    value={composeText}
+                    onChange={(e) => setComposeText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        sendComposedMessage();
+                      }
                     }}
+                    rows={2}
+                    placeholder='e.g. "Replace this with a different version — keep the same scale, lighting, and shadow direction as the rest of the scene."'
+                    className="flex-1 resize-y rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
                   />
+                  <div className="flex shrink-0 flex-col gap-1.5">
+                    <label
+                      className="cursor-pointer rounded-md border border-ink-650 bg-ink-850 px-2.5 py-1.5 text-center text-[11px] text-ink-200 hover:border-ink-500"
+                      title="Attach reference images"
+                    >
+                      {attachmentUploading ? "…" : "📎"}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        className="hidden"
+                        disabled={attachmentUploading}
+                        onChange={(e) => {
+                          void handleAttachmentFiles(e.target.files);
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={sendComposedMessage}
+                      disabled={!composeText.trim()}
+                      className="rounded-md bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+                    >
+                      Send
+                    </button>
+                  </div>
+                </div>
+                <p className="-mt-1.5 text-[10px] text-ink-500">
+                  Enter to send, Shift+Enter for a new line. 📎 attaches
+                  reference images that travel with this element to Mic
+                  Studio; ↻ regenerates the highlighted selection itself
+                  using what you&apos;ve typed.
+                </p>
+
+                {editorError && (
+                  <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                    {editorError}
+                  </p>
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={closeEditor}
+                    className="flex-1 rounded-xl border border-ink-650 px-4 py-2.5 text-sm font-medium text-ink-300 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveEditor}
+                    disabled={!hasContent}
+                    className="flex-1 rounded-xl bg-accent-500 px-4 py-2.5 text-sm font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+                  >
+                    Save
+                  </button>
                 </div>
               </div>
-            )}
-
-            <label className="flex flex-col gap-1 text-[11px] text-ink-400">
-              Label
-              <input
-                type="text"
-                value={draftLabel}
-                onChange={(e) => setDraftLabel(e.target.value)}
-                className="rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none focus:border-accent-500"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1 text-[11px] text-ink-400">
-              Editing instruction
-              <textarea
-                value={draftPrompt}
-                onChange={(e) => setDraftPrompt(e.target.value)}
-                rows={4}
-                placeholder="e.g. Replace this with a different version — keep the same scale, lighting, and shadow direction as the rest of the scene."
-                className="resize-y rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-              />
-            </label>
-
-            <div className="flex flex-col gap-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] text-ink-400">
-                  Reference images (optional)
-                </span>
-                <label className="cursor-pointer rounded-md border border-ink-650 bg-ink-850 px-2.5 py-1 text-[11px] text-ink-200 hover:border-ink-500">
-                  {attachmentUploading ? "Uploading…" : "+ Attach"}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    className="hidden"
-                    disabled={attachmentUploading}
-                    onChange={(e) => {
-                      void handleAttachmentFiles(e.target.files);
-                      e.target.value = "";
-                    }}
-                  />
-                </label>
-              </div>
-              {draftAttachments.length > 0 && (
-                <ul className="flex flex-wrap gap-2">
-                  {draftAttachments.map((a) => (
-                    <li
-                      key={a.attachmentId}
-                      className="relative h-14 w-14 overflow-hidden rounded-md border border-ink-650 bg-ink-850"
-                    >
-                      {a.type === "image" ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={a.thumbnail}
-                          alt=""
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        <div className="flex h-full w-full items-center justify-center text-[10px] text-ink-400">
-                          video
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => removeDraftAttachment(a.attachmentId)}
-                        className="absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-[10px] text-white hover:bg-black"
-                        aria-label="Remove attachment"
-                      >
-                        ✕
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
             </div>
-
-            {editorError && (
-              <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-                {editorError}
-              </p>
-            )}
-
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={closeEditor}
-                className="flex-1 rounded-xl border border-ink-650 px-4 py-2.5 text-sm font-medium text-ink-300 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={saveEditor}
-                disabled={!draftPrompt.trim()}
-                className="flex-1 rounded-xl bg-accent-500 px-4 py-2.5 text-sm font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+          );
+        })()}
 
       {showIncompleteWarning && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
