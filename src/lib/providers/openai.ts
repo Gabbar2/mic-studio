@@ -38,7 +38,10 @@ interface EditElementImageParams {
   prompt: string;
 }
 
-const MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1";
+// gpt-image-1 was retired by OpenAI on 2026-10-23; gpt-image-2 is its
+// current successor for the edits endpoint. Overridable via env var without
+// a code change, since OpenAI's lineup has already moved once this session.
+const MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-2";
 
 async function fetchBytes(url: string): Promise<Buffer> {
   if (url.startsWith("data:")) {
