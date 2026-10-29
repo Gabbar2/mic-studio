@@ -18,6 +18,11 @@ import {
 } from "@/lib/referenceTransfer";
 import type { ElementRecord } from "@/lib/promptCombiner";
 import {
+  extractYouTubeVideoId,
+  youtubeSearchUrl,
+  type YouTubeLicense,
+} from "@/lib/youtube";
+import {
   MODELS,
   getModel,
   durationsFor,
@@ -107,6 +112,19 @@ function ReferenceEditorInner() {
   // Only one at a time; the selector is a full-screen modal.
   const [selectorClipId, setSelectorClipId] = useState<string | null>(null);
 
+  // A pasted YouTube link never loads as a direct video regardless of its
+  // license — YouTube blocks that outside its own player — so instead of
+  // letting it fail with the generic playback error, this checks the
+  // video's declared license first and explains whether it's even legally
+  // reusable, then disables the field either way (see handleUrlSubmit).
+  const [checkingLicense, setCheckingLicense] = useState(false);
+  const [licenseNotice, setLicenseNotice] = useState<{
+    license: YouTubeLicense;
+    message: string;
+  } | null>(null);
+  const [urlFieldBlocked, setUrlFieldBlocked] = useState(false);
+  const [ccQuery, setCcQuery] = useState("");
+
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
 
@@ -144,6 +162,69 @@ function ReferenceEditorInner() {
     };
     probe.src = objectUrl;
   }, []);
+
+  /**
+   * Routes a pasted URL to the right path before touching the video
+   * element at all. A YouTube link skips loadSource entirely — it would
+   * only fail there with a generic error — and instead gets checked
+   * against YouTube's own declared license via /api/youtube-license:
+   *  - Creative Commons: told they're free to reuse it, but still pointed
+   *    at downloading it through a legitimate route and using "Choose a
+   *    video" — a CC license is permission to reuse, not a technical
+   *    download path this app (or YouTube itself) provides.
+   *  - Standard license, or unreadable (private/deleted/lookup failed):
+   *    told plainly they likely don't have the right to reuse it.
+   * Either way the field is disabled afterward — a YouTube link can never
+   * proceed through this field, only the specific guidance differs. Any
+   * other URL (a direct video file) goes through loadSource exactly as
+   * before this check existed.
+   */
+  async function handleUrlSubmit(url: string) {
+    const videoId = extractYouTubeVideoId(url);
+    if (!videoId) {
+      loadSource(null, url);
+      return;
+    }
+
+    setError(null);
+    setLicenseNotice(null);
+    setCheckingLicense(true);
+    try {
+      const res = await fetch("/api/youtube-license", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const json = (await res.json()) as {
+        license?: YouTubeLicense;
+        error?: string;
+      };
+      if (!res.ok || !json.license) {
+        throw new Error(json.error ?? "Could not check that video's license.");
+      }
+
+      const message =
+        json.license === "creativeCommon"
+          ? "This video is marked Creative Commons — you're free to reuse it. YouTube still won't let this app load it directly, though: download it through YouTube's own download option (if the creator enabled it) or another legitimate source, then use “Choose a video” above."
+          : "This video has a standard YouTube license (or its license couldn't be confirmed), so you likely don't have the right to reuse it. This app won't process a YouTube link either way — paste or upload a video you have the rights to use instead.";
+
+      setLicenseNotice({ license: json.license, message });
+      setUrlFieldBlocked(true);
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Could not check that video's license.",
+      );
+    } finally {
+      setCheckingLicense(false);
+    }
+  }
+
+  function resetUrlField() {
+    setLicenseNotice(null);
+    setUrlFieldBlocked(false);
+    setError(null);
+    if (urlInputRef.current) urlInputRef.current.value = "";
+  }
 
   async function handlePrepare() {
     if (!model || !meta || !sourceUrl) return;
@@ -401,19 +482,84 @@ function ReferenceEditorInner() {
               e.target.value = "";
             }}
           />
-          <div className="mt-2 flex w-full max-w-sm items-center gap-2 px-4">
-            <input
-              ref={urlInputRef}
-              type="url"
-              placeholder="or paste a public video URL"
-              className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  const url = urlInputRef.current?.value.trim();
-                  if (url) loadSource(null, url);
-                }
-              }}
-            />
+          <div className="mt-2 flex w-full max-w-sm flex-col gap-1.5 px-4">
+            <div className="flex items-center gap-2">
+              <input
+                ref={urlInputRef}
+                type="url"
+                placeholder="or paste a public video URL"
+                disabled={urlFieldBlocked || checkingLicense}
+                className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const url = urlInputRef.current?.value.trim();
+                    if (url) void handleUrlSubmit(url);
+                  }
+                }}
+              />
+              {urlFieldBlocked && (
+                <button
+                  type="button"
+                  onClick={resetUrlField}
+                  className="shrink-0 text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {checkingLicense && (
+              <p className="text-[11px] text-ink-400">
+                Checking this video&apos;s license…
+              </p>
+            )}
+
+            {licenseNotice && (
+              <p
+                className={`rounded-lg border px-2.5 py-2 text-[11px] leading-relaxed ${
+                  licenseNotice.license === "creativeCommon"
+                    ? "border-accent-500/30 bg-accent-500/[0.08] text-ink-200"
+                    : "border-red-500/30 bg-red-500/10 text-red-300"
+                }`}
+              >
+                {licenseNotice.message}
+              </p>
+            )}
+
+            {/* Finds Creative Commons footage on YouTube without ever
+                trying to fetch it from there directly — see the doc
+                comment on youtubeSearchUrl in lib/youtube.ts for why this
+                opens a normal search rather than a pre-filtered one. */}
+            <div className="flex items-center gap-2 border-t border-ink-800 pt-1.5">
+              <input
+                type="text"
+                value={ccQuery}
+                onChange={(e) => setCcQuery(e.target.value)}
+                placeholder="search footage, e.g. “city traffic at night”"
+                className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+              />
+              <a
+                href={ccQuery.trim() ? youtubeSearchUrl(ccQuery.trim()) : undefined}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-disabled={!ccQuery.trim()}
+                onClick={(e) => {
+                  if (!ccQuery.trim()) e.preventDefault();
+                }}
+                className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
+                  ccQuery.trim()
+                    ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
+                    : "cursor-not-allowed bg-ink-700 text-ink-400"
+                }`}
+              >
+                Search YouTube ↗
+              </a>
+            </div>
+            <p className="text-[10px] text-ink-500">
+              Opens YouTube in a new tab — click Filters → License →
+              Creative Commons there to narrow it down, then download a clip
+              you have the right to use and come back here to upload it.
+            </p>
           </div>
         </div>
       )}
