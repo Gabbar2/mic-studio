@@ -104,6 +104,10 @@ function ReferenceEditorInner() {
   const { granted } = useUploadConsent();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
+  // The "paste the clip's URL here" field that appears inside a footage-site
+  // panel (Pexels, Pixabay, …) only after the person has clicked "Go" and
+  // been sent to that site — see siteVisited below.
+  const siteUrlInputRef = useRef<HTMLInputElement>(null);
   // A plain incrementing counter rather than Date.now()/crypto.randomUUID() —
   // both read impure/nondeterministic sources the lint rules for component
   // purity flag even from inside an event handler defined in the component
@@ -147,6 +151,11 @@ function ReferenceEditorInner() {
   // currently open — only one can be open at a time, so one field is
   // enough rather than one per site.
   const [siteQuery, setSiteQuery] = useState("");
+  // True once the person has clicked "Go ↗" and actually been sent to the
+  // open footage-site panel's site — the paste-the-clip's-URL field below
+  // the search box only appears then, since there's nothing to paste until
+  // they've been there and copied a link.
+  const [siteVisited, setSiteVisited] = useState(false);
   // The empty-state media box starts on a row of buttons — Choose a video,
   // Paste YouTube URL, one per FOOTAGE_SITES entry — and swaps to whichever
   // one was clicked, hiding the buttons in favor of that one expanded
@@ -159,6 +168,10 @@ function ReferenceEditorInner() {
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
 
+  // setIncluded is a useState setter (stable identity), so it's intentionally
+  // left out of the dependency array below; the compiler's own inference
+  // flags this as a mismatch but it isn't a real staleness bug.
+  // eslint-disable-next-line react-hooks/preserve-manual-memoization
   const loadSource = useCallback((file: File | null, remoteUrl: string) => {
     setError(null);
     setClips([]);
@@ -260,6 +273,7 @@ function ReferenceEditorInner() {
   function backToMediaButtons() {
     resetUrlField();
     setSiteQuery("");
+    setSiteVisited(false);
     setMediaInputMode("buttons");
   }
 
@@ -534,7 +548,10 @@ function ReferenceEditorInner() {
                   <button
                     key={site.key}
                     type="button"
-                    onClick={() => setMediaInputMode(site.key)}
+                    onClick={() => {
+                      setSiteVisited(false);
+                      setMediaInputMode(site.key);
+                    }}
                     className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
                   >
                     {site.label} ›
@@ -650,7 +667,11 @@ function ReferenceEditorInner() {
                       rel="noopener noreferrer"
                       aria-disabled={!siteQuery.trim()}
                       onClick={(e) => {
-                        if (!siteQuery.trim()) e.preventDefault();
+                        if (!siteQuery.trim()) {
+                          e.preventDefault();
+                          return;
+                        }
+                        setSiteVisited(true);
                       }}
                       className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
                         siteQuery.trim()
@@ -662,11 +683,40 @@ function ReferenceEditorInner() {
                     </a>
                   </div>
                   <p className="text-[10px] text-ink-500">
-                    Opens {site.label} in a new tab — copy a clip&apos;s direct
-                    video link there, then paste it below under &quot;Paste
-                    YouTube URL&quot;&apos;s field (it accepts any direct video
-                    URL, not just YouTube).
+                    Opens {site.label} in a new tab — find a clip there, copy
+                    its direct video link, then paste it below to bring it in.
                   </p>
+
+                  {/* Only appears once they've actually clicked Go and been
+                      sent to the site — nothing to paste before that. */}
+                  {siteVisited && (
+                    <div className="flex items-center gap-2 border-t border-ink-700 pt-1.5">
+                      <input
+                        ref={siteUrlInputRef}
+                        type="url"
+                        autoFocus
+                        placeholder={`paste the ${site.label} video URL`}
+                        className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const url = siteUrlInputRef.current?.value.trim();
+                            if (url) void handleUrlSubmit(url);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        disabled={checkingLicense}
+                        onClick={() => {
+                          const url = siteUrlInputRef.current?.value.trim();
+                          if (url) void handleUrlSubmit(url);
+                        }}
+                        className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-wait disabled:opacity-60"
+                      >
+                        Load
+                      </button>
+                    </div>
+                  )}
                 </div>
               ),
           )}
