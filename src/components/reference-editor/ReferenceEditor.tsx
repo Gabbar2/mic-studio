@@ -17,11 +17,31 @@ import {
   type ReferenceTransferJob,
 } from "@/lib/referenceTransfer";
 import type { ElementRecord } from "@/lib/promptCombiner";
-import {
-  extractYouTubeVideoId,
-  youtubeSearchUrl,
-  type YouTubeLicense,
-} from "@/lib/youtube";
+import { extractYouTubeVideoId, type YouTubeLicense } from "@/lib/youtube";
+
+/**
+ * Sites that hand out real, directly-linkable video files — unlike YouTube,
+ * pasting one of these straight into the URL field just works, no license
+ * gate needed, because that's what these sites are built for. Shown as
+ * their own expand-a-search-field buttons next to "Paste YouTube URL",
+ * since a YouTube link search only ever ends in "now go download it
+ * elsewhere" (see the YouTube panel below) while these end in "paste the
+ * link, done".
+ */
+const FOOTAGE_SITES = [
+  {
+    key: "pexels",
+    label: "Pexels",
+    searchUrl: (q: string) =>
+      `https://www.pexels.com/search/videos/${encodeURIComponent(q)}/`,
+  },
+  {
+    key: "pixabay",
+    label: "Pixabay",
+    searchUrl: (q: string) =>
+      `https://pixabay.com/videos/search/${encodeURIComponent(q)}/`,
+  },
+] as const;
 import {
   MODELS,
   getModel,
@@ -123,14 +143,17 @@ function ReferenceEditorInner() {
     message: string;
   } | null>(null);
   const [urlFieldBlocked, setUrlFieldBlocked] = useState(false);
-  const [ccQuery, setCcQuery] = useState("");
-  // The empty-state media box starts on three buttons — Choose a video,
-  // YouTube Search, Paste YouTube URL — and swaps to whichever one of the
-  // latter two was clicked, hiding the buttons in favor of that one
-  // expanded field. "← Back" returns to the three-button view and clears
-  // whatever was in progress.
+  // Reused for whichever footage-site panel (Pexels, Pixabay, …) is
+  // currently open — only one can be open at a time, so one field is
+  // enough rather than one per site.
+  const [siteQuery, setSiteQuery] = useState("");
+  // The empty-state media box starts on a row of buttons — Choose a video,
+  // Paste YouTube URL, one per FOOTAGE_SITES entry — and swaps to whichever
+  // one was clicked, hiding the buttons in favor of that one expanded
+  // field. "← Back" returns to the button row and clears whatever was in
+  // progress.
   const [mediaInputMode, setMediaInputMode] = useState<
-    "buttons" | "paste" | "search"
+    "buttons" | "paste" | (typeof FOOTAGE_SITES)[number]["key"]
   >("buttons");
 
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
@@ -236,7 +259,7 @@ function ReferenceEditorInner() {
 
   function backToMediaButtons() {
     resetUrlField();
-    setCcQuery("");
+    setSiteQuery("");
     setMediaInputMode("buttons");
   }
 
@@ -499,14 +522,7 @@ function ReferenceEditorInner() {
                 Choose a video
               </button>
               <p className="text-xs text-ink-400">or drag & drop, or paste</p>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setMediaInputMode("search")}
-                  className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
-                >
-                  YouTube Search ›
-                </button>
+              <div className="flex flex-wrap items-center justify-center gap-2">
                 <button
                   type="button"
                   onClick={() => setMediaInputMode("paste")}
@@ -514,6 +530,16 @@ function ReferenceEditorInner() {
                 >
                   Paste YouTube URL
                 </button>
+                {FOOTAGE_SITES.map((site) => (
+                  <button
+                    key={site.key}
+                    type="button"
+                    onClick={() => setMediaInputMode(site.key)}
+                    className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
+                  >
+                    {site.label} ›
+                  </button>
+                ))}
               </div>
             </>
           )}
@@ -542,13 +568,25 @@ function ReferenceEditorInner() {
                     }
                   }}
                 />
-                {urlFieldBlocked && (
+                {urlFieldBlocked ? (
                   <button
                     type="button"
                     onClick={resetUrlField}
                     className="shrink-0 text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
                   >
                     Clear
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={checkingLicense}
+                    onClick={() => {
+                      const url = urlInputRef.current?.value.trim();
+                      if (url) void handleUrlSubmit(url);
+                    }}
+                    className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-wait disabled:opacity-60"
+                  >
+                    Go
                   </button>
                 )}
               </div>
@@ -573,54 +611,64 @@ function ReferenceEditorInner() {
             </div>
           )}
 
-          {mediaInputMode === "search" && (
-            <div className="flex w-full max-w-sm flex-col gap-1.5 px-4">
-              <button
-                type="button"
-                onClick={backToMediaButtons}
-                className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
-              >
-                ← Back
-              </button>
-              {/* Finds Creative Commons footage on YouTube without ever
-                  trying to fetch it from there directly — see the doc
-                  comment on youtubeSearchUrl in lib/youtube.ts for why this
-                  opens a normal search rather than a pre-filtered one. */}
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  autoFocus
-                  value={ccQuery}
-                  onChange={(e) => setCcQuery(e.target.value)}
-                  placeholder="search footage, e.g. “city traffic at night”"
-                  className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-                />
-                <a
-                  href={
-                    ccQuery.trim() ? youtubeSearchUrl(ccQuery.trim()) : undefined
-                  }
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  aria-disabled={!ccQuery.trim()}
-                  onClick={(e) => {
-                    if (!ccQuery.trim()) e.preventDefault();
-                  }}
-                  className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
-                    ccQuery.trim()
-                      ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
-                      : "cursor-not-allowed bg-ink-700 text-ink-400"
-                  }`}
+          {FOOTAGE_SITES.map(
+            (site) =>
+              mediaInputMode === site.key && (
+                <div
+                  key={site.key}
+                  className="flex w-full max-w-sm flex-col gap-1.5 px-4"
                 >
-                  Search YouTube ↗
-                </a>
-              </div>
-              <p className="text-[10px] text-ink-500">
-                Opens YouTube in a new tab — click Filters → License →
-                Creative Commons there to narrow it down, then download a
-                clip you have the right to use and come back here to upload
-                it.
-              </p>
-            </div>
+                  <button
+                    type="button"
+                    onClick={backToMediaButtons}
+                    className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
+                  >
+                    ← Back
+                  </button>
+                  {/* These sites hand back a direct, playable video file
+                      URL, so there's nothing to extract or download here —
+                      the "Go" link just opens their own search results in a
+                      new tab, and the person pastes the clip's real URL into
+                      "Paste YouTube URL"'s sibling flow (the generic
+                      paste-a-video-URL box) once they've picked one. */}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      autoFocus
+                      value={siteQuery}
+                      onChange={(e) => setSiteQuery(e.target.value)}
+                      placeholder="search footage, e.g. “city traffic at night”"
+                      className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+                    />
+                    <a
+                      href={
+                        siteQuery.trim()
+                          ? site.searchUrl(siteQuery.trim())
+                          : undefined
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-disabled={!siteQuery.trim()}
+                      onClick={(e) => {
+                        if (!siteQuery.trim()) e.preventDefault();
+                      }}
+                      className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
+                        siteQuery.trim()
+                          ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
+                          : "cursor-not-allowed bg-ink-700 text-ink-400"
+                      }`}
+                    >
+                      Go ↗
+                    </a>
+                  </div>
+                  <p className="text-[10px] text-ink-500">
+                    Opens {site.label} in a new tab — copy a clip&apos;s direct
+                    video link there, then paste it below under &quot;Paste
+                    YouTube URL&quot;&apos;s field (it accepts any direct video
+                    URL, not just YouTube).
+                  </p>
+                </div>
+              ),
           )}
         </div>
       )}
