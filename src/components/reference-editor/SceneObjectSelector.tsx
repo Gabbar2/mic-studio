@@ -904,7 +904,7 @@ export default function SceneObjectSelector({
           )}
 
           {frameDataUrl && (
-            <div className="relative flex max-h-[65vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
+            <div className="relative mx-auto flex max-h-[65vh] w-fit items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
               {/*
                * Tightly wraps the img (no extra width from the centering
                * flex parent above) so every absolutely-positioned child here
