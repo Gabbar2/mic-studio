@@ -124,6 +124,14 @@ function ReferenceEditorInner() {
   } | null>(null);
   const [urlFieldBlocked, setUrlFieldBlocked] = useState(false);
   const [ccQuery, setCcQuery] = useState("");
+  // The empty-state media box starts on three buttons — Choose a video,
+  // YouTube Search, Paste YouTube URL — and swaps to whichever one of the
+  // latter two was clicked, hiding the buttons in favor of that one
+  // expanded field. "← Back" returns to the three-button view and clears
+  // whatever was in progress.
+  const [mediaInputMode, setMediaInputMode] = useState<
+    "buttons" | "paste" | "search"
+  >("buttons");
 
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
@@ -224,6 +232,12 @@ function ReferenceEditorInner() {
     setUrlFieldBlocked(false);
     setError(null);
     if (urlInputRef.current) urlInputRef.current.value = "";
+  }
+
+  function backToMediaButtons() {
+    resetUrlField();
+    setCcQuery("");
+    setMediaInputMode("buttons");
   }
 
   async function handlePrepare() {
@@ -463,14 +477,6 @@ function ReferenceEditorInner() {
               : "border-accent-500/35 bg-ink-850 hover:border-accent-500/70"
           }`}
         >
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-semibold text-accent-ink hover:bg-accent-400"
-          >
-            Choose a video
-          </button>
-          <p className="text-xs text-ink-400">or drag & drop, or paste</p>
           <input
             ref={fileInputRef}
             type="file"
@@ -482,85 +488,140 @@ function ReferenceEditorInner() {
               e.target.value = "";
             }}
           />
-          <div className="mt-2 flex w-full max-w-sm flex-col gap-1.5 px-4">
-            <div className="flex items-center gap-2">
-              <input
-                ref={urlInputRef}
-                type="url"
-                placeholder="or paste a public video URL"
-                disabled={urlFieldBlocked || checkingLicense}
-                className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    const url = urlInputRef.current?.value.trim();
-                    if (url) void handleUrlSubmit(url);
-                  }
-                }}
-              />
-              {urlFieldBlocked && (
+
+          {mediaInputMode === "buttons" && (
+            <>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-semibold text-accent-ink hover:bg-accent-400"
+              >
+                Choose a video
+              </button>
+              <p className="text-xs text-ink-400">or drag & drop, or paste</p>
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={resetUrlField}
-                  className="shrink-0 text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
+                  onClick={() => setMediaInputMode("search")}
+                  className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
                 >
-                  Clear
+                  YouTube Search ›
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setMediaInputMode("paste")}
+                  className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
+                >
+                  Paste YouTube URL
+                </button>
+              </div>
+            </>
+          )}
+
+          {mediaInputMode === "paste" && (
+            <div className="flex w-full max-w-sm flex-col gap-1.5 px-4">
+              <button
+                type="button"
+                onClick={backToMediaButtons}
+                className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
+              >
+                ← Back
+              </button>
+              <div className="flex items-center gap-2">
+                <input
+                  ref={urlInputRef}
+                  type="url"
+                  autoFocus
+                  placeholder="paste a YouTube URL"
+                  disabled={urlFieldBlocked || checkingLicense}
+                  className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const url = urlInputRef.current?.value.trim();
+                      if (url) void handleUrlSubmit(url);
+                    }
+                  }}
+                />
+                {urlFieldBlocked && (
+                  <button
+                    type="button"
+                    onClick={resetUrlField}
+                    className="shrink-0 text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              {checkingLicense && (
+                <p className="text-[11px] text-ink-400">
+                  Checking this video&apos;s license…
+                </p>
+              )}
+
+              {licenseNotice && (
+                <p
+                  className={`rounded-lg border px-2.5 py-2 text-[11px] leading-relaxed ${
+                    licenseNotice.license === "creativeCommon"
+                      ? "border-accent-500/30 bg-accent-500/[0.08] text-ink-200"
+                      : "border-red-500/30 bg-red-500/10 text-red-300"
+                  }`}
+                >
+                  {licenseNotice.message}
+                </p>
               )}
             </div>
+          )}
 
-            {checkingLicense && (
-              <p className="text-[11px] text-ink-400">
-                Checking this video&apos;s license…
-              </p>
-            )}
-
-            {licenseNotice && (
-              <p
-                className={`rounded-lg border px-2.5 py-2 text-[11px] leading-relaxed ${
-                  licenseNotice.license === "creativeCommon"
-                    ? "border-accent-500/30 bg-accent-500/[0.08] text-ink-200"
-                    : "border-red-500/30 bg-red-500/10 text-red-300"
-                }`}
+          {mediaInputMode === "search" && (
+            <div className="flex w-full max-w-sm flex-col gap-1.5 px-4">
+              <button
+                type="button"
+                onClick={backToMediaButtons}
+                className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
               >
-                {licenseNotice.message}
+                ← Back
+              </button>
+              {/* Finds Creative Commons footage on YouTube without ever
+                  trying to fetch it from there directly — see the doc
+                  comment on youtubeSearchUrl in lib/youtube.ts for why this
+                  opens a normal search rather than a pre-filtered one. */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  autoFocus
+                  value={ccQuery}
+                  onChange={(e) => setCcQuery(e.target.value)}
+                  placeholder="search footage, e.g. “city traffic at night”"
+                  className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+                />
+                <a
+                  href={
+                    ccQuery.trim() ? youtubeSearchUrl(ccQuery.trim()) : undefined
+                  }
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-disabled={!ccQuery.trim()}
+                  onClick={(e) => {
+                    if (!ccQuery.trim()) e.preventDefault();
+                  }}
+                  className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
+                    ccQuery.trim()
+                      ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
+                      : "cursor-not-allowed bg-ink-700 text-ink-400"
+                  }`}
+                >
+                  Search YouTube ↗
+                </a>
+              </div>
+              <p className="text-[10px] text-ink-500">
+                Opens YouTube in a new tab — click Filters → License →
+                Creative Commons there to narrow it down, then download a
+                clip you have the right to use and come back here to upload
+                it.
               </p>
-            )}
-
-            {/* Finds Creative Commons footage on YouTube without ever
-                trying to fetch it from there directly — see the doc
-                comment on youtubeSearchUrl in lib/youtube.ts for why this
-                opens a normal search rather than a pre-filtered one. */}
-            <div className="flex items-center gap-2 border-t border-ink-800 pt-1.5">
-              <input
-                type="text"
-                value={ccQuery}
-                onChange={(e) => setCcQuery(e.target.value)}
-                placeholder="search footage, e.g. “city traffic at night”"
-                className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-              />
-              <a
-                href={ccQuery.trim() ? youtubeSearchUrl(ccQuery.trim()) : undefined}
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-disabled={!ccQuery.trim()}
-                onClick={(e) => {
-                  if (!ccQuery.trim()) e.preventDefault();
-                }}
-                className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
-                  ccQuery.trim()
-                    ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
-                    : "cursor-not-allowed bg-ink-700 text-ink-400"
-                }`}
-              >
-                Search YouTube ↗
-              </a>
             </div>
-            <p className="text-[10px] text-ink-500">
-              Opens YouTube in a new tab — click Filters → License →
-              Creative Commons there to narrow it down, then download a clip
-              you have the right to use and come back here to upload it.
-            </p>
-          </div>
+          )}
         </div>
       )}
 
@@ -583,6 +644,7 @@ function ReferenceEditorInner() {
                 setMeta(null);
                 setClips([]);
                 setIncluded({});
+                backToMediaButtons();
               }}
               className="ml-auto text-accent-400 underline underline-offset-2 hover:text-white"
             >
