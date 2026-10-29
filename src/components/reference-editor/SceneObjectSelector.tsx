@@ -875,7 +875,7 @@ export default function SceneObjectSelector({
   return (
     <>
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-        <div className="flex max-h-[90vh] w-full max-w-lg flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
+        <div className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-semibold text-white">
               Select objects &amp; backgrounds
@@ -904,7 +904,7 @@ export default function SceneObjectSelector({
           )}
 
           {frameDataUrl && (
-            <div className="relative flex max-h-[45vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
+            <div className="relative flex max-h-[65vh] items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
               {/*
                * Tightly wraps the img (no extra width from the centering
                * flex parent above) so every absolutely-positioned child here
@@ -918,7 +918,7 @@ export default function SceneObjectSelector({
                   src={frameDataUrl}
                   alt=""
                   draggable={false}
-                  className="block max-h-[45vh] w-auto max-w-full select-none object-contain"
+                  className="block max-h-[65vh] w-auto max-w-full select-none object-contain"
                 />
                 {/*
                  * Every element stays highlighted on the frame, not just the
