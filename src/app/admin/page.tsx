@@ -3,6 +3,7 @@ import { requireAdmin } from "@/lib/admin";
 import UsersTable from "@/components/admin/UsersTable";
 import RetentionCleanupPanel from "@/components/admin/RetentionCleanupPanel";
 import ElementEditSettingsPanel from "@/components/admin/ElementEditSettingsPanel";
+import UsersExportButton from "@/components/admin/UsersExportButton";
 
 export const dynamic = "force-dynamic";
 
@@ -88,9 +89,12 @@ export default async function AdminUsersPage() {
           <h1 className="text-2xl font-semibold tracking-tight text-white">
             Users
           </h1>
-          <span className="text-xs tabular-nums text-ink-400">
-            {rows.length} accounts
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs tabular-nums text-ink-400">
+              {rows.length} accounts
+            </span>
+            <UsersExportButton />
+          </div>
         </div>
 
         <div className="mt-6">
