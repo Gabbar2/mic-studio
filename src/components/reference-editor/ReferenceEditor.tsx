@@ -89,6 +89,9 @@ type Stage = "empty" | "loaded" | "preparing" | "ready";
  */
 interface SnapRecord {
   id: string;
+  /** Where in the source clip this was taken from — drives the 📍 marker
+   * TrimTimeline draws on the track for it. */
+  atSeconds: number;
   frameDataUrl: string;
   frameWidth: number;
   frameHeight: number;
@@ -166,6 +169,13 @@ function ReferenceEditorInner() {
     clipId: string;
     snapId: string;
   } | null>(null);
+  // True once the person explicitly asks to adjust the trim range again
+  // (TrimTimeline's "🔓 Adjust trim range" link) after a clip has already
+  // been prepared. trimLocked below is what TrimTimeline actually reads;
+  // this only overrides it, and gets reset back to false the next time
+  // handlePrepare runs, so the range re-locks for whatever gets prepared
+  // next rather than staying unlocked indefinitely.
+  const [trimUnlocked, setTrimUnlocked] = useState(false);
 
   // A pasted YouTube link never loads as a direct video regardless of its
   // license — YouTube blocks that outside its own player — so instead of
@@ -320,6 +330,10 @@ function ReferenceEditorInner() {
     // everything, since that's swapping the source entirely.
     setStage("preparing");
     setError(null);
+    // Re-locks the trim range for whatever gets prepared by this run — if
+    // the person unlocked it to pick a different range for another scene,
+    // that's done once this fires; see trimUnlocked's own doc comment.
+    setTrimUnlocked(false);
     // Tracked separately from the `clips` state (which this closure can
     // only see as of the render that started this run) so the catch below
     // knows whether THIS run added anything before failing, even if
@@ -516,7 +530,7 @@ function ReferenceEditorInner() {
    * TrimTimeline for pixel dimensions) means TrimTimeline doesn't need to
    * know anything about SceneObjectSelector's frameWidth/frameHeight needs.
    */
-  function handleTakeSnap(dataUrl: string) {
+  function handleTakeSnap(dataUrl: string, atSeconds: number) {
     if (clips.length === 0) return;
     const targetClipId = clips[clips.length - 1].job.id;
     const img = new Image();
@@ -524,6 +538,7 @@ function ReferenceEditorInner() {
       snapSeq.current += 1;
       const snap: SnapRecord = {
         id: `snap-${snapSeq.current}`,
+        atSeconds,
         frameDataUrl: dataUrl,
         frameWidth: img.naturalWidth || 960,
         frameHeight: img.naturalHeight || 540,
@@ -537,6 +552,14 @@ function ReferenceEditorInner() {
     };
     img.src = dataUrl;
   }
+
+  // The trim handles lock once a clip exists, until explicitly reopened —
+  // see trimUnlocked's doc comment. The markers shown on the track are only
+  // ever the most recently prepared clip's own snaps, matching which clip
+  // "Take Snap"/click-to-mark actually attach to (handleTakeSnap above).
+  const trimLocked = clips.length > 0 && !trimUnlocked;
+  const activeClipSnapSeconds =
+    clips.length > 0 ? clips[clips.length - 1].snaps.map((s) => s.atSeconds) : [];
 
   const selectorSnapClip = selectorSnap
     ? (clips.find((c) => c.job.id === selectorSnap.clipId) ?? null)
@@ -941,6 +964,9 @@ function ReferenceEditorInner() {
             capSeconds={capSeconds}
             canTakeSnap={clips.length > 0}
             onTakeSnap={handleTakeSnap}
+            snapMarkers={activeClipSnapSeconds}
+            locked={trimLocked}
+            onRequestUnlock={() => setTrimUnlocked(true)}
           />
 
           {/* --- Prepare -------------------------------------------------- */}
