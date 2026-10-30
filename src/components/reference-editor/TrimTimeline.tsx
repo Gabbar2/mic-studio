@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { captureThumbnail } from "@/lib/videoThumbnail";
 
 const THUMBS = 10;
 
@@ -25,6 +26,8 @@ export default function TrimTimeline({
   end,
   onRangeChange,
   capSeconds,
+  canTakeSnap,
+  onTakeSnap,
 }: {
   src: string;
   durationSeconds: number;
@@ -36,12 +39,46 @@ export default function TrimTimeline({
    * the range itself, so switching to a roomier model doesn't lose a trim
    * the person already made. */
   capSeconds: number;
+  /** Whether "Take Snap" should be offered at all — the parent only passes
+   * true once at least one clip has actually been prepared, since a snap is
+   * grabbed *for* an already-prepared clip (its edits get folded into that
+   * clip's own image references — see ReferenceEditor's handleTakeSnap),
+   * not a standalone thing. */
+  canTakeSnap: boolean;
+  /** Fired with a freshly captured frame (a JPEG data URL) once "Take Snap"
+   * finishes — grabbed from wherever the preview's own playhead currently
+   * is, via the same captureThumbnail helper the scene-clip thumbnails
+   * already use, rather than drawing the live <video> element directly, so
+   * this doesn't need its own CORS/crossOrigin handling. */
+  onTakeSnap: (dataUrl: string) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const [playhead, setPlayhead] = useState(0);
   const [thumbs, setThumbs] = useState<string[]>([]);
   const [dragging, setDragging] = useState<"start" | "end" | null>(null);
+  const [snapping, setSnapping] = useState(false);
+  const [snapError, setSnapError] = useState<string | null>(null);
+
+  async function takeSnap() {
+    if (snapping) return;
+    setSnapping(true);
+    setSnapError(null);
+    try {
+      const dataUrl = await captureThumbnail(src, playhead, 960, 960);
+      if (dataUrl) {
+        onTakeSnap(dataUrl);
+      } else {
+        // Same CORS caveat as the thumbnail strip above — a pasted URL
+        // without permissive headers can't be captured from here.
+        setSnapError(
+          "Could not capture a frame here — this source may be blocking it. Try a different moment, or a file you uploaded directly.",
+        );
+      }
+    } finally {
+      setSnapping(false);
+    }
+  }
 
   // Generates the thumbnail strip once per source — seeks a throwaway video
   // element to THUMBS evenly spaced points and captures each frame. Done
@@ -210,14 +247,33 @@ export default function TrimTimeline({
             {fmt(start)} → {fmt(end)}
           </span>
         </span>
-        <button
-          type="button"
-          onClick={() => onRangeChange(0, durationSeconds)}
-          className="text-accent-400 underline underline-offset-2 hover:text-white"
-        >
-          Reset trim
-        </button>
+        <div className="flex items-center gap-3">
+          {canTakeSnap && (
+            <button
+              type="button"
+              onClick={() => void takeSnap()}
+              disabled={snapping}
+              title="Grab the frame currently showing above as an extra still to edit"
+              className="rounded-md border border-ink-650 bg-ink-850 px-2 py-1 font-medium text-ink-200 hover:border-accent-500 hover:text-white disabled:cursor-wait disabled:opacity-60"
+            >
+              {snapping ? "Capturing…" : "📸 Take Snap"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onRangeChange(0, durationSeconds)}
+            className="text-accent-400 underline underline-offset-2 hover:text-white"
+          >
+            Reset trim
+          </button>
+        </div>
       </div>
+
+      {snapError && (
+        <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+          {snapError}
+        </p>
+      )}
 
       {overCap && (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/[0.08] px-3 py-2 text-[11px] leading-relaxed text-amber-200">
