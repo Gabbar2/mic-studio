@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { captureThumbnail } from "@/lib/videoThumbnail";
 
 const THUMBS = 10;
@@ -28,6 +28,9 @@ export default function TrimTimeline({
   capSeconds,
   canTakeSnap,
   onTakeSnap,
+  snapMarkers,
+  locked,
+  onRequestUnlock,
 }: {
   src: string;
   durationSeconds: number;
@@ -39,18 +42,34 @@ export default function TrimTimeline({
    * the range itself, so switching to a roomier model doesn't lose a trim
    * the person already made. */
   capSeconds: number;
-  /** Whether "Take Snap" should be offered at all — the parent only passes
+  /** Whether snap-taking should be offered at all — the parent only passes
    * true once at least one clip has actually been prepared, since a snap is
    * grabbed *for* an already-prepared clip (its edits get folded into that
    * clip's own image references — see ReferenceEditor's handleTakeSnap),
-   * not a standalone thing. */
+   * not a standalone thing. Gates both the "Take Snap" button and
+   * click-to-mark on the track below. */
   canTakeSnap: boolean;
-  /** Fired with a freshly captured frame (a JPEG data URL) once "Take Snap"
-   * finishes — grabbed from wherever the preview's own playhead currently
-   * is, via the same captureThumbnail helper the scene-clip thumbnails
-   * already use, rather than drawing the live <video> element directly, so
-   * this doesn't need its own CORS/crossOrigin handling. */
-  onTakeSnap: (dataUrl: string) => void;
+  /** Fired with a freshly captured frame (a JPEG data URL) and the exact
+   * moment it was taken at, once either "Take Snap" or a click on the track
+   * finishes capturing — via the same captureThumbnail helper the scene-
+   * clip thumbnails already use, rather than drawing the live <video>
+   * element directly, so this doesn't need its own CORS/crossOrigin
+   * handling. */
+  onTakeSnap: (dataUrl: string, atSeconds: number) => void;
+  /** Where to draw a 📍 pin on the track for each snap already taken for
+   * the clip these snaps belong to — purely visual, so it's obvious at a
+   * glance where a snap came from and that clicking the track does
+   * something real. */
+  snapMarkers: number[];
+  /** True once a clip has been prepared and the trim range hasn't been
+   * explicitly reopened for editing (see onRequestUnlock) — the two drag
+   * handles stop responding while this is true, so scrubbing the preview
+   * or clicking the track to drop a snap marker can't accidentally nudge
+   * the range a clip was already cut from. */
+  locked: boolean;
+  /** Called when the person explicitly asks to adjust the trim range again
+   * (e.g. to select a different portion for another scene) while locked. */
+  onRequestUnlock: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -60,14 +79,14 @@ export default function TrimTimeline({
   const [snapping, setSnapping] = useState(false);
   const [snapError, setSnapError] = useState<string | null>(null);
 
-  async function takeSnap() {
+  async function takeSnapAt(atSeconds: number) {
     if (snapping) return;
     setSnapping(true);
     setSnapError(null);
     try {
-      const dataUrl = await captureThumbnail(src, playhead, 960, 960);
+      const dataUrl = await captureThumbnail(src, atSeconds, 960, 960);
       if (dataUrl) {
-        onTakeSnap(dataUrl);
+        onTakeSnap(dataUrl, atSeconds);
       } else {
         // Same CORS caveat as the thumbnail strip above — a pasted URL
         // without permissive headers can't be captured from here.
@@ -78,6 +97,25 @@ export default function TrimTimeline({
     } finally {
       setSnapping(false);
     }
+  }
+
+  /** The "Take Snap" button — captures wherever the video preview above is
+   * currently paused/scrubbed to. */
+  async function takeSnap() {
+    await takeSnapAt(playhead);
+  }
+
+  /** Clicking directly on the track (not a drag handle, not while dragging
+   * one) drops a marker and captures a snap at that exact point in one
+   * step — the other way in, for picking a frame straight off the
+   * filmstrip rather than scrubbing the video above first. */
+  function handleTrackClick(e: PointerEvent<HTMLDivElement>) {
+    if (!canTakeSnap || dragging) return;
+    const track = trackRef.current;
+    if (!track) return;
+    const rect = track.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    void takeSnapAt(ratio * durationSeconds);
   }
 
   // Generates the thumbnail strip once per source — seeks a throwaway video
@@ -144,7 +182,7 @@ export default function TrimTimeline({
       return ratio * durationSeconds;
     }
 
-    function onMove(e: PointerEvent) {
+    function onMove(e: globalThis.PointerEvent) {
       const t = clientXToSeconds(e.clientX);
       if (dragging === "start") {
         onRangeChange(Math.min(t, end - 0.2), end);
@@ -182,58 +220,105 @@ export default function TrimTimeline({
         />
       </div>
 
-      <div
-        ref={trackRef}
-        className="relative h-14 select-none overflow-hidden rounded-lg border border-ink-650 bg-ink-850"
-      >
-        <div className="absolute inset-0 flex">
-          {thumbs.length ? (
-            thumbs.map((t, i) => (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                key={i}
-                src={t}
-                alt=""
-                className="h-full flex-1 object-cover opacity-70"
-              />
-            ))
-          ) : (
-            <div className="flex h-full w-full items-center justify-center text-[10px] text-ink-500">
-              Generating thumbnails…
+      <div>
+        <div
+          ref={trackRef}
+          onPointerDown={handleTrackClick}
+          className={`relative h-14 select-none overflow-visible rounded-lg border border-ink-650 bg-ink-850 ${
+            canTakeSnap && !dragging ? "cursor-crosshair" : ""
+          }`}
+        >
+          <div className="absolute inset-0 overflow-hidden rounded-lg">
+            <div className="flex h-full">
+              {thumbs.length ? (
+                thumbs.map((t, i) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={i}
+                    src={t}
+                    alt=""
+                    className="h-full flex-1 object-cover opacity-70"
+                  />
+                ))
+              ) : (
+                <div className="flex h-full w-full items-center justify-center text-[10px] text-ink-500">
+                  Generating thumbnails…
+                </div>
+              )}
             </div>
-          )}
+
+            {/* Selected range */}
+            <div
+              className="pointer-events-none absolute inset-y-0 border-y-2 border-accent-400 bg-accent-500/25"
+              style={{ left: `${startPct}%`, width: `${endPct - startPct}%` }}
+            />
+
+            {/* Playhead */}
+            <div
+              className="pointer-events-none absolute inset-y-0 w-px bg-white/80"
+              style={{
+                left: `${durationSeconds ? (playhead / durationSeconds) * 100 : 0}%`,
+              }}
+            />
+          </div>
+
+          {/* Snap markers — drawn above the clipped box (overflow-visible
+              on the track) so the pin itself isn't clipped off at the top
+              edge. Purely informational: there's nothing to click here,
+              the snap thumbnails themselves (below, in the prepared-clip
+              tile) are what reopen one. */}
+          {snapMarkers.map((t, i) => (
+            <div
+              key={i}
+              className="pointer-events-none absolute -top-3.5 flex -translate-x-1/2 flex-col items-center"
+              style={{
+                left: `${durationSeconds ? (t / durationSeconds) * 100 : 0}%`,
+              }}
+            >
+              <span className="text-xs leading-none">📍</span>
+            </div>
+          ))}
+
+          {/* Start handle */}
+          <button
+            type="button"
+            aria-label="Trim start"
+            disabled={locked}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              if (!locked) setDragging("start");
+            }}
+            className={`absolute inset-y-0 w-3 touch-none rounded-sm ${
+              locked
+                ? "cursor-not-allowed bg-ink-600"
+                : "cursor-ew-resize bg-accent-400"
+            }`}
+            style={{ left: `calc(${startPct}% - 6px)` }}
+          />
+          {/* End handle */}
+          <button
+            type="button"
+            aria-label="Trim end"
+            disabled={locked}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              if (!locked) setDragging("end");
+            }}
+            className={`absolute inset-y-0 w-3 touch-none rounded-sm ${
+              locked
+                ? "cursor-not-allowed bg-ink-600"
+                : "cursor-ew-resize bg-accent-400"
+            }`}
+            style={{ left: `calc(${endPct}% - 6px)` }}
+          />
         </div>
-
-        {/* Selected range */}
-        <div
-          className="absolute inset-y-0 border-y-2 border-accent-400 bg-accent-500/25"
-          style={{ left: `${startPct}%`, width: `${endPct - startPct}%` }}
-        />
-
-        {/* Playhead */}
-        <div
-          className="pointer-events-none absolute inset-y-0 w-px bg-white/80"
-          style={{
-            left: `${durationSeconds ? (playhead / durationSeconds) * 100 : 0}%`,
-          }}
-        />
-
-        {/* Start handle */}
-        <button
-          type="button"
-          aria-label="Trim start"
-          onPointerDown={() => setDragging("start")}
-          className="absolute inset-y-0 w-3 cursor-ew-resize touch-none rounded-sm bg-accent-400"
-          style={{ left: `calc(${startPct}% - 6px)` }}
-        />
-        {/* End handle */}
-        <button
-          type="button"
-          aria-label="Trim end"
-          onPointerDown={() => setDragging("end")}
-          className="absolute inset-y-0 w-3 cursor-ew-resize touch-none rounded-sm bg-accent-400"
-          style={{ left: `calc(${endPct}% - 6px)` }}
-        />
+        {canTakeSnap && (
+          <p className="mt-1 text-[10px] text-ink-500">
+            Click anywhere on the strip above to drop a 📍 marker and grab
+            that frame as a snap, or use Take Snap below for wherever the
+            preview is currently paused.
+          </p>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink-400">
@@ -246,6 +331,7 @@ export default function TrimTimeline({
           <span className="tabular-nums">
             {fmt(start)} → {fmt(end)}
           </span>
+          {locked && <span className="text-ink-500"> · 🔒 locked</span>}
         </span>
         <div className="flex items-center gap-3">
           {canTakeSnap && (
@@ -254,18 +340,28 @@ export default function TrimTimeline({
               onClick={() => void takeSnap()}
               disabled={snapping}
               title="Grab the frame currently showing above as an extra still to edit"
-              className="rounded-md border border-ink-650 bg-ink-850 px-2 py-1 font-medium text-ink-200 hover:border-accent-500 hover:text-white disabled:cursor-wait disabled:opacity-60"
+              className="rounded-md border border-accent-500/60 bg-accent-500/15 px-2 py-1 font-medium text-accent-300 hover:border-accent-400 hover:bg-accent-500/25 hover:text-white disabled:cursor-wait disabled:opacity-60"
             >
               {snapping ? "Capturing…" : "📸 Take Snap"}
             </button>
           )}
-          <button
-            type="button"
-            onClick={() => onRangeChange(0, durationSeconds)}
-            className="text-accent-400 underline underline-offset-2 hover:text-white"
-          >
-            Reset trim
-          </button>
+          {locked ? (
+            <button
+              type="button"
+              onClick={onRequestUnlock}
+              className="text-accent-400 underline underline-offset-2 hover:text-white"
+            >
+              🔓 Adjust trim range
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onRangeChange(0, durationSeconds)}
+              className="text-accent-400 underline underline-offset-2 hover:text-white"
+            >
+              Reset trim
+            </button>
+          )}
         </div>
       </div>
 
