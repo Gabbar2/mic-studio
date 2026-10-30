@@ -588,7 +588,46 @@ export default function SceneObjectSelector({
     setEditorError(null);
   }
 
+  /**
+   * Both the header "Close" link and the footer "Cancel" button route here.
+   * Neither autosaves — only the "Save" button writes the thread back onto
+   * the element (see saveEditor) — so closing this straight after "Send"
+   * silently threw away a just-generated result if the person hadn't
+   * noticed they still needed to scroll down and press Save. This now
+   * checks for exactly that and asks first, rather than discarding
+   * something that took a real OpenAI call to produce.
+   */
   function closeEditor() {
+    if (editingElement) {
+      const draftPrompt = [
+        ...draftMessages
+          .filter((m): m is Extract<EditorMessage, { role: "user" }> =>
+            m.role === "user",
+          )
+          .map((m) => m.text),
+        composeText.trim(),
+      ]
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+      const attachmentsChanged =
+        draftAttachments.length !== editingElement.attachments.length ||
+        draftAttachments.some(
+          (a, i) =>
+            a.attachmentId !== editingElement.attachments[i]?.attachmentId,
+        );
+      const hasUnsavedChanges =
+        draftPrompt !== editingElement.rawPrompt ||
+        lastGeneratedUrl !== editingElement.generatedImageUrl ||
+        attachmentsChanged;
+      if (
+        hasUnsavedChanges &&
+        !window.confirm(
+          "This element has a generated result or typed instruction that hasn't been saved yet. Close without saving it?",
+        )
+      ) {
+        return;
+      }
+    }
     setEditingElementId(null);
     setEditorError(null);
   }
