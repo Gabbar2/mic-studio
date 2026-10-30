@@ -132,6 +132,7 @@ export default function SceneObjectSelector({
   sourceHeight,
   clipStart,
   clipEnd,
+  presetFrameDataUrl,
   elements,
   onElementsChange,
   granted,
@@ -143,6 +144,15 @@ export default function SceneObjectSelector({
   sourceHeight: number;
   clipStart: number;
   clipEnd: number;
+  /** When set (a "Take Snap" still, already captured at a specific moment
+   * the person scrubbed to), this exact frame is used directly instead of
+   * extracting one from sourceUrl via clipStart/clipEnd's midpoint — see
+   * the prepareFrame effect below. sourceUrl/clipStart/clipEnd are still
+   * required by the type (and still used for the Dataset 1 record's own
+   * sourceFrameSeconds bookkeeping) even in this case. sourceWidth/
+   * sourceHeight should be this frame's own pixel size when this is set,
+   * not the parent clip's. */
+  presetFrameDataUrl?: string | null;
   elements: ElementRecord[];
   onElementsChange: (
     updater: (prev: ElementRecord[]) => ElementRecord[],
@@ -246,12 +256,14 @@ export default function SceneObjectSelector({
           1,
           Math.round((width * (sourceHeight || 1)) / (sourceWidth || 1)),
         );
-        const dataUrl = await captureThumbnail(
-          sourceUrl,
-          (clipStart + clipEnd) / 2,
-          width,
-          height,
-        );
+        const dataUrl = presetFrameDataUrl
+          ? presetFrameDataUrl
+          : await captureThumbnail(
+              sourceUrl,
+              (clipStart + clipEnd) / 2,
+              width,
+              height,
+            );
         if (!dataUrl) {
           throw new Error(
             "Could not capture a frame from this clip to select from.",
@@ -285,7 +297,7 @@ export default function SceneObjectSelector({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceUrl, clipStart, clipEnd]);
+  }, [sourceUrl, clipStart, clipEnd, presetFrameDataUrl]);
 
   // Auto-detect pills: a best-effort suggestion list, so most of the time
   // nobody has to type a description from scratch at all. Deliberately
