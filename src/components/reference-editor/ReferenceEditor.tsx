@@ -99,6 +99,13 @@ interface SnapRecord {
    * same reason it lives outside SceneObjectSelector as PreparedClip's own
    * `elements` field (see below). */
   elements: ElementRecord[];
+  /** True once this snap's edits have been folded onto its parent clip's
+   * job via saveSnapPrompt. A snap that was only ever taken — never opened
+   * in "Select objects" — stays false forever, which is how
+   * continueInStudio (below) knows it still needs to upload that snap's
+   * raw frameDataUrl and append it as its own reference, rather than
+   * assuming every snap already made it into referenceImageUrls. */
+  mergedIntoClip: boolean;
 }
 
 interface PreparedClip {
@@ -169,6 +176,12 @@ function ReferenceEditorInner() {
     clipId: string;
     snapId: string;
   } | null>(null);
+  // True from the moment "Continue in Mic Studio" is clicked until the
+  // browser actually navigates away (or the handoff fails) — guards against
+  // a second click re-running the upload-and-navigate work (and, since
+  // clicking again mid-navigation did nothing visible before, made it look
+  // like the first click hadn't registered).
+  const [navigatingToStudio, setNavigatingToStudio] = useState(false);
 
   // A pasted YouTube link never loads as a direct video regardless of its
   // license — YouTube blocks that outside its own player — so instead of
@@ -532,6 +545,7 @@ function ReferenceEditorInner() {
         frameWidth: img.naturalWidth || 960,
         frameHeight: img.naturalHeight || 540,
         elements: [],
+        mergedIntoClip: false,
       };
       setClips((prev) =>
         prev.map((c) =>
@@ -616,27 +630,83 @@ function ReferenceEditorInner() {
             referenceImageUrls: mergedImageUrls,
             prompt: mergedPrompt,
           },
+          snaps: c.snaps.map((s) =>
+            s.id === snapId ? { ...s, mergedIntoClip: true } : s,
+          ),
         };
       }),
     );
     setSelectorSnap(null);
   }
 
-  function continueInStudio() {
-    if (selectedJobs.length === 0) return;
-    writeReferenceTransfer(selectedJobs);
-    // A full browser navigation, not router.push — Studio's mount effect
-    // (the one that reads the prepared clips back out of sessionStorage)
-    // only ever runs once, on mount. If Studio was already visited earlier
-    // in this tab this session, Next's client-side router can reuse its
-    // cached render of that page instead of remounting it, which means that
-    // effect never fires again and the just-written transfer sits unread —
-    // landing on a stale Studio page with none of these clips loaded. A
-    // real navigation guarantees a fresh mount every time, at the cost of
-    // a full page reload for what's a one-time hop between two different
-    // parts of the app anyway.
-    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- deliberate: see comment above
-    window.location.href = "/studio";
+  /**
+   * Besides the edited snaps saveSnapPrompt already folds in, a snap that
+   * was only ever taken — never opened in "Select objects", so
+   * mergedIntoClip is still false — has nothing in referenceImageUrls yet:
+   * its only record is the raw frameDataUrl sitting in memory. This uploads
+   * each such snap's frame (same uploadMedia path a clip's own trimmed
+   * video goes through) and appends the resulting URL, capped at the
+   * model's own reference limit just like saveSnapPrompt does, so every
+   * snap taken — edited or not — ends up as a reference once the user
+   * continues to Studio.
+   */
+  async function appendUnmergedSnaps(
+    job: ReferenceTransferJob,
+    snaps: SnapRecord[],
+  ): Promise<ReferenceTransferJob> {
+    const unmerged = snaps.filter((s) => !s.mergedIntoClip);
+    if (unmerged.length === 0) return job;
+    const uploaded: string[] = [];
+    for (const s of unmerged) {
+      try {
+        const blob = await (await fetch(s.frameDataUrl)).blob();
+        const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
+        const url = await uploadMedia(file, "image", granted);
+        uploaded.push(url);
+      } catch {
+        // Best-effort — one snap failing to upload shouldn't block the
+        // rest of the handoff to Studio.
+      }
+    }
+    if (uploaded.length === 0) return job;
+    return {
+      ...job,
+      referenceImageUrls: [...job.referenceImageUrls, ...uploaded].slice(
+        0,
+        model.maxReferences,
+      ),
+    };
+  }
+
+  async function continueInStudio() {
+    if (selectedJobs.length === 0 || navigatingToStudio) return;
+    setNavigatingToStudio(true);
+    setError(null);
+    try {
+      const finalJobs = await Promise.all(
+        clips
+          .filter((c) => included[c.job.id] !== false)
+          .map((c) => appendUnmergedSnaps(c.job, c.snaps)),
+      );
+      writeReferenceTransfer(finalJobs);
+      // A full browser navigation, not router.push — Studio's mount effect
+      // (the one that reads the prepared clips back out of sessionStorage)
+      // only ever runs once, on mount. If Studio was already visited earlier
+      // in this tab this session, Next's client-side router can reuse its
+      // cached render of that page instead of remounting it, which means that
+      // effect never fires again and the just-written transfer sits unread —
+      // landing on a stale Studio page with none of these clips loaded. A
+      // real navigation guarantees a fresh mount every time, at the cost of
+      // a full page reload for what's a one-time hop between two different
+      // parts of the app anyway.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- deliberate: see comment above
+      window.location.href = "/studio";
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Could not continue to Mic Studio.",
+      );
+      setNavigatingToStudio(false);
+    }
   }
 
   return (
@@ -1155,11 +1225,15 @@ function ReferenceEditorInner() {
 
             <button
               type="button"
-              onClick={continueInStudio}
-              disabled={stage !== "ready" || selectedJobs.length === 0}
+              onClick={() => void continueInStudio()}
+              disabled={
+                stage !== "ready" ||
+                selectedJobs.length === 0 ||
+                navigatingToStudio
+              }
               className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
             >
-              Continue in Mic Studio →
+              {navigatingToStudio ? "Opening Studio…" : "Continue in Mic Studio →"}
             </button>
             <p className="text-center text-[11px] text-ink-400">
               Opens Studio with {model?.label} and{" "}
