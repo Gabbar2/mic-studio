@@ -173,15 +173,24 @@ export default function SceneObjectSelector({
   const nextColor = (count: number) =>
     HIGHLIGHT_COLORS[count % HIGHLIGHT_COLORS.length];
 
-  // Manual drawing fallback — see the component doc comment above. Two
-  // shapes share one pending/name/confirm flow: "box" is drag-a-rectangle,
-  // "pencil" is freehand.
+  // Manual drawing fallback — see the component doc comment above. "box" vs
+  // "pencil" picks the stroke shape; "add"/"subtract" (the two boolean-op
+  // buttons) picks how each finished stroke combines into the selection
+  // being built — several strokes, of either shape, fold together onto one
+  // accumulator canvas (manualAccumCanvasRef) before it's named and turned
+  // into an element, the same way Photoshop/Figma's add/subtract selection
+  // modes work. `pendingMaskUrl` is a snapshot of that accumulator after
+  // the most recent stroke — both what the naming UI confirms and what's
+  // shown as a live highlight on the frame while more strokes are added.
   const [manualMode, setManualMode] = useState(false);
   const [drawShape, setDrawShape] = useState<"box" | "pencil">("box");
+  const [manualCombineMode, setManualCombineMode] = useState<
+    "add" | "subtract"
+  >("add");
   const [dragRect, setDragRect] = useState<DragRect | null>(null);
   const [freehandPoints, setFreehandPoints] = useState<Point[] | null>(null);
-  const [pendingManualShape, setPendingManualShape] =
-    useState<ManualShape | null>(null);
+  const [pendingMaskUrl, setPendingMaskUrl] = useState<string | null>(null);
+  const manualAccumCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [manualName, setManualName] = useState("");
   const draggingRef = useRef(false);
 
@@ -455,8 +464,7 @@ export default function SceneObjectSelector({
         const r = normalizeRect(prev);
         // Ignore an accidental tap/click — require a real drag.
         if (r.right - r.left < 0.02 || r.bottom - r.top < 0.02) return null;
-        setPendingManualShape({ kind: "box", rect: prev });
-        setManualName("");
+        commitManualStroke({ kind: "box", rect: prev });
         return null;
       });
     } else {
@@ -465,60 +473,95 @@ export default function SceneObjectSelector({
         const b = pointsBounds(prev);
         // Same accidental-tap guard as the box tool.
         if (b.right - b.left < 0.02 && b.bottom - b.top < 0.02) return null;
-        setPendingManualShape({ kind: "pencil", points: prev });
-        setManualName("");
+        commitManualStroke({ kind: "pencil", points: prev });
         return null;
       });
     }
   }
 
-  /** Rasterizes a finished manual shape into a standalone mask image on a
-   * transparent canvas, at the frame's own pixel size, so it composites with
-   * the colored-highlight CSS mask the exact same way a fal-returned mask
-   * does. A box fills a rect; a pencil stroke fills the closed polygon its
-   * points trace — `closePath` connects the last point back to the first,
-   * same as the live SVG preview already shows while drawing. */
-  function shapeToMaskDataUrl(shape: ManualShape): string | null {
-    if (!frameSize) return null;
-    const canvas = document.createElement("canvas");
-    canvas.width = frameSize.width;
-    canvas.height = frameSize.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-    ctx.fillStyle = "#ffffff";
-
+  /** Fills a finished shape's path onto whatever canvas/context the caller
+   * set up (fillStyle and compositeOperation are the caller's to control) —
+   * a box fills a rect; a pencil stroke fills the closed polygon its points
+   * trace, `closePath` connecting the last point back to the first, same as
+   * the live SVG preview already shows while drawing. Shared by both the
+   * add and subtract paths in commitManualStroke below, since painting the
+   * shape itself is identical either way — only the compositing differs. */
+  function paintShapePath(
+    ctx: CanvasRenderingContext2D,
+    shape: ManualShape,
+    size: { width: number; height: number },
+  ) {
     if (shape.kind === "box") {
       const r = normalizeRect(shape.rect);
       ctx.fillRect(
-        r.left * frameSize.width,
-        r.top * frameSize.height,
-        (r.right - r.left) * frameSize.width,
-        (r.bottom - r.top) * frameSize.height,
+        r.left * size.width,
+        r.top * size.height,
+        (r.right - r.left) * size.width,
+        (r.bottom - r.top) * size.height,
       );
     } else {
       const [first, ...rest] = shape.points;
       ctx.beginPath();
-      ctx.moveTo(first.x * frameSize.width, first.y * frameSize.height);
+      ctx.moveTo(first.x * size.width, first.y * size.height);
       for (const p of rest) {
-        ctx.lineTo(p.x * frameSize.width, p.y * frameSize.height);
+        ctx.lineTo(p.x * size.width, p.y * size.height);
       }
       ctx.closePath();
       ctx.fill();
     }
+  }
 
-    return canvas.toDataURL("image/png");
+  /**
+   * Paints one finished box/pencil stroke onto the running selection being
+   * built — manualAccumCanvasRef, created lazily and kept alive across
+   * strokes until the selection is named (confirmManualSelection) or
+   * abandoned (resetManualSelection). The very first stroke of a fresh
+   * selection always adds, regardless of which combine button is active —
+   * subtracting from nothing would just be a confusing no-op — every stroke
+   * after that follows manualCombineMode: "add" paints in normal
+   * source-over (white-on-white still reads as the same opaque selection,
+   * so overlapping an existing region back in is harmless), "subtract"
+   * paints with destination-out, which erases wherever the new shape's
+   * alpha is set regardless of its fill color, carving it out of whatever
+   * was already there.
+   */
+  function commitManualStroke(shape: ManualShape) {
+    if (!frameSize) return;
+    let canvas = manualAccumCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      canvas.width = frameSize.width;
+      canvas.height = frameSize.height;
+      manualAccumCanvasRef.current = canvas;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      setError("Could not create that selection — try again.");
+      return;
+    }
+    const isFirstStroke = pendingMaskUrl === null;
+    ctx.globalCompositeOperation =
+      isFirstStroke || manualCombineMode === "add"
+        ? "source-over"
+        : "destination-out";
+    ctx.fillStyle = "#ffffff";
+    paintShapePath(ctx, shape, frameSize);
+    ctx.globalCompositeOperation = "source-over";
+    setPendingMaskUrl(canvas.toDataURL("image/png"));
+  }
+
+  /** Discards the in-progress accumulator so the next stroke starts a brand
+   * new selection — used by Cancel, Escape, and toggling manual mode off. */
+  function resetManualSelection() {
+    manualAccumCanvasRef.current = null;
+    setPendingMaskUrl(null);
   }
 
   function confirmManualSelection() {
     const name = manualName.trim();
-    if (!pendingManualShape || !name) return;
-    const maskUrl = shapeToMaskDataUrl(pendingManualShape);
-    if (!maskUrl) {
-      setError("Could not create that selection — try again.");
-      return;
-    }
-    addElement(name, maskUrl, null);
-    setPendingManualShape(null);
+    if (!pendingMaskUrl || !name) return;
+    addElement(name, pendingMaskUrl, null);
+    resetManualSelection();
     setManualName("");
   }
 
@@ -992,6 +1035,19 @@ export default function SceneObjectSelector({
                     className="pointer-events-none absolute inset-0 h-full w-full animate-pulse object-contain opacity-70 mix-blend-screen"
                   />
                 )}
+                {/* The manual selection being built, across however many
+                    add/subtract strokes so far — shown between strokes (the
+                    in-progress single stroke itself has its own live preview
+                    further below) so it's clear what the next stroke will
+                    add to or carve out of. */}
+                {pendingMaskUrl && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={pendingMaskUrl}
+                    alt=""
+                    className="pointer-events-none absolute inset-0 h-full w-full object-contain opacity-70 mix-blend-screen"
+                  />
+                )}
                 {segmenting && (
                   <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-xs text-white">
                     Detecting…
@@ -1065,7 +1121,7 @@ export default function SceneObjectSelector({
                   setManualMode((m) => !m);
                   setDragRect(null);
                   setFreehandPoints(null);
-                  setPendingManualShape(null);
+                  resetManualSelection();
                 }}
                 className={`rounded-md border px-2.5 py-1 text-[11px] font-medium transition ${
                   manualMode
@@ -1078,41 +1134,78 @@ export default function SceneObjectSelector({
                   : "✎ Draw a selection manually"}
               </button>
               {manualMode && (
-                <div className="flex overflow-hidden rounded-md border border-ink-650">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDrawShape("box");
-                      setFreehandPoints(null);
-                    }}
-                    className={`px-2.5 py-1 text-[11px] font-medium transition ${
-                      drawShape === "box"
-                        ? "bg-accent-500 text-accent-ink"
-                        : "bg-ink-850 text-ink-300 hover:text-white"
-                    }`}
-                  >
-                    ▭ Box
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDrawShape("pencil");
-                      setDragRect(null);
-                    }}
-                    className={`px-2.5 py-1 text-[11px] font-medium transition ${
-                      drawShape === "pencil"
-                        ? "bg-accent-500 text-accent-ink"
-                        : "bg-ink-850 text-ink-300 hover:text-white"
-                    }`}
-                  >
-                    ✎ Pencil
-                  </button>
-                </div>
+                <>
+                  <div className="flex overflow-hidden rounded-md border border-ink-650">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDrawShape("box");
+                        setFreehandPoints(null);
+                      }}
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        drawShape === "box"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ▭ Box
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDrawShape("pencil");
+                        setDragRect(null);
+                      }}
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        drawShape === "pencil"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ✎ Pencil
+                    </button>
+                  </div>
+                  {/* Which way each new box/pencil stroke combines into the
+                      selection being built — see commitManualStroke's doc
+                      comment. Only meaningful once there's already something
+                      to add to or subtract from, but left always visible
+                      (rather than only after the first stroke) so it reads
+                      as "how the next stroke will behave" from the start,
+                      not a control that appears out of nowhere mid-draw. */}
+                  <div className="flex overflow-hidden rounded-md border border-ink-650">
+                    <button
+                      type="button"
+                      onClick={() => setManualCombineMode("add")}
+                      title="Add to selection"
+                      aria-label="Add to selection"
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        manualCombineMode === "add"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ⊕ Add
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setManualCombineMode("subtract")}
+                      title="Subtract from selection"
+                      aria-label="Subtract from selection"
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        manualCombineMode === "subtract"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ⊖ Subtract
+                    </button>
+                  </div>
+                </>
               )}
             </div>
           )}
 
-          {pendingManualShape && (
+          {pendingMaskUrl && (
             <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
               <input
                 type="text"
@@ -1122,11 +1215,11 @@ export default function SceneObjectSelector({
                 onKeyDown={(e) => {
                   if (e.key === "Enter") confirmManualSelection();
                   if (e.key === "Escape") {
-                    setPendingManualShape(null);
+                    resetManualSelection();
                     setManualName("");
                   }
                 }}
-                placeholder="Name this selection, e.g. “the grapefruit”"
+                placeholder="Name this selection, e.g. “the grapefruit” — or keep drawing to add/subtract more first"
                 className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
               />
               <button
@@ -1140,7 +1233,7 @@ export default function SceneObjectSelector({
               <button
                 type="button"
                 onClick={() => {
-                  setPendingManualShape(null);
+                  resetManualSelection();
                   setManualName("");
                 }}
                 className="shrink-0 text-xs text-ink-400 hover:text-white"
