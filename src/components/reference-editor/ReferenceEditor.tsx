@@ -276,10 +276,20 @@ function ReferenceEditorInner() {
       return;
     }
 
+    // Deliberately does NOT clear `clips`/`included` here — this can run
+    // again after a person has already prepared one selection (they adjust
+    // the trim range and hit "Prepare clip(s)" again to add more scenes),
+    // and wiping the list on every run would silently throw away clips they
+    // already reviewed and kept. Each run's new clips are appended below
+    // instead. "Replace video" (above) is the one place that still clears
+    // everything, since that's swapping the source entirely.
     setStage("preparing");
     setError(null);
-    setClips([]);
-    setIncluded({});
+    // Tracked separately from the `clips` state (which this closure can
+    // only see as of the render that started this run) so the catch below
+    // knows whether THIS run added anything before failing, even if
+    // `clips` itself was still empty when the run began.
+    let addedThisRun = 0;
 
     try {
       // Remote URLs need their actual bytes for ffmpeg — a local File
@@ -330,7 +340,6 @@ function ReferenceEditorInner() {
         capSeconds || Infinity,
       );
       const aspectRatio = guessAspectRatio(meta.width, meta.height);
-      const newClips: PreparedClip[] = [];
 
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
@@ -378,19 +387,18 @@ function ReferenceEditorInner() {
           (seg.start + seg.end) / 2,
         );
 
-        newClips.push({
-          job,
-          start: seg.start,
-          end: seg.end,
-          thumbnail,
-          elements: [],
-        });
-        // Shown as each one finishes rather than all at once at the end —
-        // there can now be several scenes, and watching them land one by
-        // one is a better signal of real progress than a single spinner
-        // that doesn't move until the whole batch is done.
-        setClips([...newClips]);
+        // Appended onto whatever was already prepared — not replaced — so
+        // running this again after an earlier run keeps those clips. Shown
+        // as each one finishes rather than all at once at the end — there
+        // can now be several scenes, and watching them land one by one is a
+        // better signal of real progress than a single spinner that doesn't
+        // move until the whole batch is done.
+        setClips((prev) => [
+          ...prev,
+          { job, start: seg.start, end: seg.end, thumbnail, elements: [] },
+        ]);
         setIncluded((prev) => ({ ...prev, [job.id]: true }));
+        addedThisRun += 1;
       }
 
       setStage("ready");
@@ -402,7 +410,12 @@ function ReferenceEditorInner() {
       // thrown is visible at all.
       console.error("[reference-editor] prepare failed:", e);
       setError(e instanceof Error ? e.message : "Could not prepare the clip.");
-      setStage("loaded");
+      // "ready" (not "loaded") whenever there's something to show — either
+      // clips already sitting there from an earlier run, or ones this run
+      // itself managed to add before hitting the error — so a failure
+      // partway through a second run doesn't hide clips already reviewed
+      // and kept.
+      setStage(clips.length > 0 || addedThisRun > 0 ? "ready" : "loaded");
     }
   }
 
