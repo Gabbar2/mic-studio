@@ -77,6 +77,27 @@ function guessAspectRatio(width: number, height: number): AspectRatio {
 
 type Stage = "empty" | "loaded" | "preparing" | "ready";
 
+/**
+ * An extra still frame grabbed from the trim timeline's "Take Snap" button
+ * — a quick way to pull a second (or third…) specific frame out of a clip
+ * to run through its own "Select objects & backgrounds" pass, without
+ * re-trimming and re-encoding a whole new clip just to get one still. Not a
+ * destination of its own: whatever gets edited on a snap is folded onto its
+ * parent clip's own job (prompt + image references) once saved — see
+ * saveSnapPrompt — so a clip can end up with references from its own
+ * auto-captured frame AND from one or more snaps, all combined.
+ */
+interface SnapRecord {
+  id: string;
+  frameDataUrl: string;
+  frameWidth: number;
+  frameHeight: number;
+  /** Dataset 1 for this snap's own multi-element editing — same shape and
+   * same reason it lives outside SceneObjectSelector as PreparedClip's own
+   * `elements` field (see below). */
+  elements: ElementRecord[];
+}
+
 interface PreparedClip {
   job: ReferenceTransferJob;
   start: number;
@@ -90,6 +111,9 @@ interface PreparedClip {
    * same lifetime as everything else in this editor.
    */
   elements: ElementRecord[];
+  /** Extra frames grabbed via "Take Snap" while this clip was the most
+   * recently prepared one — see SnapRecord above. */
+  snaps: SnapRecord[];
 }
 
 export default function ReferenceEditor() {
@@ -110,6 +134,7 @@ function ReferenceEditorInner() {
   // body. A ref mutated only in response to a click is exactly what refs are
   // for.
   const jobSeq = useRef(0);
+  const snapSeq = useRef(0);
 
   const [stage, setStage] = useState<Stage>("empty");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -131,6 +156,16 @@ function ReferenceEditorInner() {
   // Which clip's object/background selector is open — null when closed.
   // Only one at a time; the selector is a full-screen modal.
   const [selectorClipId, setSelectorClipId] = useState<string | null>(null);
+  // Same idea, one level down — which snap's own selector is open. Separate
+  // from selectorClipId rather than a union of the two, since a clip's own
+  // selector and one of its snaps' selectors are opened from different UI
+  // (the "Select objects →" button vs. a snap thumbnail) and saved through
+  // different paths (savePromptForClip replaces the job's prompt/refs;
+  // saveSnapPrompt merges onto whatever's already there — see both below).
+  const [selectorSnap, setSelectorSnap] = useState<{
+    clipId: string;
+    snapId: string;
+  } | null>(null);
 
   // A pasted YouTube link never loads as a direct video regardless of its
   // license — YouTube blocks that outside its own player — so instead of
@@ -395,7 +430,14 @@ function ReferenceEditorInner() {
         // move until the whole batch is done.
         setClips((prev) => [
           ...prev,
-          { job, start: seg.start, end: seg.end, thumbnail, elements: [] },
+          {
+            job,
+            start: seg.start,
+            end: seg.end,
+            thumbnail,
+            elements: [],
+            snaps: [],
+          },
         ]);
         setIncluded((prev) => ({ ...prev, [job.id]: true }));
         addedThisRun += 1;
@@ -460,6 +502,107 @@ function ReferenceEditorInner() {
         c.job.id === clipId ? { ...c, elements: updater(c.elements) } : c,
       ),
     );
+  }
+
+  /**
+   * "Take Snap" on the trim timeline hands back a freshly captured JPEG
+   * data URL — this turns it into a SnapRecord and attaches it to whichever
+   * clip was prepared most recently (clips[clips.length - 1]), since that's
+   * "the selected clip" in the normal one-clip-at-a-time flow this was
+   * built for; TrimTimeline itself only offers the button once clips.length
+   * > 0 (see canTakeSnap below), so this should never fire with an empty
+   * list, but the guard is cheap insurance against the button briefly being
+   * stale mid-render. Decoding the data URL here (rather than asking
+   * TrimTimeline for pixel dimensions) means TrimTimeline doesn't need to
+   * know anything about SceneObjectSelector's frameWidth/frameHeight needs.
+   */
+  function handleTakeSnap(dataUrl: string) {
+    if (clips.length === 0) return;
+    const targetClipId = clips[clips.length - 1].job.id;
+    const img = new Image();
+    img.onload = () => {
+      snapSeq.current += 1;
+      const snap: SnapRecord = {
+        id: `snap-${snapSeq.current}`,
+        frameDataUrl: dataUrl,
+        frameWidth: img.naturalWidth || 960,
+        frameHeight: img.naturalHeight || 540,
+        elements: [],
+      };
+      setClips((prev) =>
+        prev.map((c) =>
+          c.job.id === targetClipId ? { ...c, snaps: [...c.snaps, snap] } : c,
+        ),
+      );
+    };
+    img.src = dataUrl;
+  }
+
+  const selectorSnapClip = selectorSnap
+    ? (clips.find((c) => c.job.id === selectorSnap.clipId) ?? null)
+    : null;
+  const selectorSnapRecord =
+    selectorSnapClip?.snaps.find((s) => s.id === selectorSnap?.snapId) ??
+    null;
+
+  /** Dataset 1 updater for whichever snap's selector is currently open —
+   * same role as setClipElements above, one level down. */
+  function setSnapElements(
+    clipId: string,
+    snapId: string,
+    updater: (prev: ElementRecord[]) => ElementRecord[],
+  ) {
+    setClips((prev) =>
+      prev.map((c) =>
+        c.job.id === clipId
+          ? {
+              ...c,
+              snaps: c.snaps.map((s) =>
+                s.id === snapId ? { ...s, elements: updater(s.elements) } : s,
+              ),
+            }
+          : c,
+      ),
+    );
+  }
+
+  /**
+   * A snap isn't its own destination (see SnapRecord's doc comment) — Save
+   * here folds its Dataset 2 onto the parent clip's existing job instead of
+   * replacing it the way savePromptForClip does for the clip's own
+   * selector: image references are appended (capped at the current model's
+   * own reference limit, so stacking several snaps' edits onto one clip
+   * can't silently produce more slots than Mic Studio actually has), and
+   * the prompt text is appended as a further paragraph so the snap's own
+   * instructions aren't lost.
+   */
+  function saveSnapPrompt(
+    clipId: string,
+    snapId: string,
+    result: { prompt: string; referenceImageUrls: string[] },
+  ) {
+    setClips((prev) =>
+      prev.map((c) => {
+        if (c.job.id !== clipId) return c;
+        const mergedImageUrls = [
+          ...c.job.referenceImageUrls,
+          ...result.referenceImageUrls,
+        ].slice(0, model.maxReferences);
+        const mergedPrompt = [c.job.prompt, result.prompt]
+          .map((t) => t.trim())
+          .filter((t) => t.length > 0)
+          .join("\n\n");
+        return {
+          ...c,
+          job: {
+            ...c.job,
+            referenceImageUrls: mergedImageUrls,
+            prompt: mergedPrompt,
+          },
+        };
+      }),
+    );
+    setSelectorSnap(null);
   }
 
   function continueInStudio() {
@@ -796,6 +939,8 @@ function ReferenceEditorInner() {
             end={range.end}
             onRangeChange={(start, end) => setRange({ start, end })}
             capSeconds={capSeconds}
+            canTakeSnap={clips.length > 0}
+            onTakeSnap={handleTakeSnap}
           />
 
           {/* --- Prepare -------------------------------------------------- */}
@@ -939,6 +1084,47 @@ function ReferenceEditorInner() {
                         ? "Selections set — edit →"
                         : "Select objects →"}
                     </button>
+                    {/* Extra frames grabbed for this clip via "Take Snap" —
+                        each opens its own Select-objects pass; whatever
+                        gets saved there folds onto this clip's own prompt
+                        and image references (see saveSnapPrompt), so these
+                        aren't a separate thing to include/exclude below. */}
+                    {c.snaps.length > 0 && (
+                      <div className="flex flex-wrap gap-1 border-t border-ink-650 bg-ink-900 p-1.5">
+                        {c.snaps.map((s) => (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setSelectorSnap({
+                                clipId: c.job.id,
+                                snapId: s.id,
+                              });
+                            }}
+                            title={
+                              s.elements.some((el) => el.status === "completed")
+                                ? "Snap — selections set, edit →"
+                                : "Snap — select objects →"
+                            }
+                            className="relative h-8 w-8 shrink-0 overflow-hidden rounded border border-ink-650 hover:border-accent-400"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={s.frameDataUrl}
+                              alt=""
+                              className="h-full w-full object-cover"
+                            />
+                            {s.elements.some(
+                              (el) => el.status === "completed",
+                            ) && (
+                              <span className="absolute bottom-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-accent-400" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </label>
                 );
               })}
@@ -987,6 +1173,34 @@ function ReferenceEditorInner() {
           granted={granted}
           onClose={() => setSelectorClipId(null)}
           onSave={(result) => savePromptForClip(selectorClip.job.id, result)}
+        />
+      )}
+
+      {selectorSnapRecord && selectorSnapClip && (
+        <SceneObjectSelector
+          sourceUrl={sourceUrl}
+          sourceWidth={selectorSnapRecord.frameWidth}
+          sourceHeight={selectorSnapRecord.frameHeight}
+          clipStart={selectorSnapClip.start}
+          clipEnd={selectorSnapClip.end}
+          presetFrameDataUrl={selectorSnapRecord.frameDataUrl}
+          elements={selectorSnapRecord.elements}
+          onElementsChange={(updater) =>
+            setSnapElements(
+              selectorSnapClip.job.id,
+              selectorSnapRecord.id,
+              updater,
+            )
+          }
+          granted={granted}
+          onClose={() => setSelectorSnap(null)}
+          onSave={(result) =>
+            saveSnapPrompt(
+              selectorSnapClip.job.id,
+              selectorSnapRecord.id,
+              result,
+            )
+          }
         />
       )}
     </div>
