@@ -169,13 +169,6 @@ function ReferenceEditorInner() {
     clipId: string;
     snapId: string;
   } | null>(null);
-  // True once the person explicitly asks to adjust the trim range again
-  // (TrimTimeline's "🔓 Adjust trim range" link) after a clip has already
-  // been prepared. trimLocked below is what TrimTimeline actually reads;
-  // this only overrides it, and gets reset back to false the next time
-  // handlePrepare runs, so the range re-locks for whatever gets prepared
-  // next rather than staying unlocked indefinitely.
-  const [trimUnlocked, setTrimUnlocked] = useState(false);
 
   // A pasted YouTube link never loads as a direct video regardless of its
   // license — YouTube blocks that outside its own player — so instead of
@@ -330,10 +323,6 @@ function ReferenceEditorInner() {
     // everything, since that's swapping the source entirely.
     setStage("preparing");
     setError(null);
-    // Re-locks the trim range for whatever gets prepared by this run — if
-    // the person unlocked it to pick a different range for another scene,
-    // that's done once this fires; see trimUnlocked's own doc comment.
-    setTrimUnlocked(false);
     // Tracked separately from the `clips` state (which this closure can
     // only see as of the render that started this run) so the catch below
     // knows whether THIS run added anything before failing, even if
@@ -553,13 +542,18 @@ function ReferenceEditorInner() {
     img.src = dataUrl;
   }
 
-  // The trim handles lock once a clip exists, until explicitly reopened —
-  // see trimUnlocked's doc comment. The markers shown on the track are only
-  // ever the most recently prepared clip's own snaps, matching which clip
-  // "Take Snap"/click-to-mark actually attach to (handleTakeSnap above).
-  const trimLocked = clips.length > 0 && !trimUnlocked;
-  const activeClipSnapSeconds =
-    clips.length > 0 ? clips[clips.length - 1].snaps.map((s) => s.atSeconds) : [];
+  // Whichever clip "Take Snap" attaches new snaps to, and the trim handles
+  // lock against once it exists — always the most recently prepared one,
+  // matching the normal one-clip-at-a-time flow this was built for. Once a
+  // clip has been prepared, the trim range stays locked for good: this app
+  // doesn't offer a way to unlock it again (see TrimTimeline — no "adjust
+  // range" control), so a later clip's own range always comes from a fresh
+  // trim before its own Prepare run, not a reopened one.
+  const activeClip = clips.length > 0 ? clips[clips.length - 1] : null;
+  const trimLocked = clips.length > 0;
+  const activeClipSnapSeconds = activeClip
+    ? activeClip.snaps.map((s) => s.atSeconds)
+    : [];
 
   const selectorSnapClip = selectorSnap
     ? (clips.find((c) => c.job.id === selectorSnap.clipId) ?? null)
@@ -966,7 +960,6 @@ function ReferenceEditorInner() {
             onTakeSnap={handleTakeSnap}
             snapMarkers={activeClipSnapSeconds}
             locked={trimLocked}
-            onRequestUnlock={() => setTrimUnlocked(true)}
           />
 
           {/* --- Prepare -------------------------------------------------- */}
@@ -997,6 +990,51 @@ function ReferenceEditorInner() {
         <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </p>
+      )}
+
+      {/* --- Snaps ------------------------------------------------------- */}
+      {/* Its own section, separate from the "Clip ready" tiles below — a
+          snap isn't a scene, it's an extra still pulled from whichever clip
+          was prepared most recently (activeClip). Whatever gets edited on
+          one still folds onto that clip's own prompt/image references when
+          saved (saveSnapPrompt), it's just not nested inside that clip's
+          tile visually. */}
+      {activeClip && activeClip.snaps.length > 0 && (
+        <div className="space-y-2 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
+          <h2 className="text-sm font-semibold text-white">📍 Snaps</h2>
+          <p className="text-[11px] text-ink-400">
+            Extra frames grabbed from the trim timeline above. Tap one to
+            select objects on it — whatever you save there is added onto the
+            clip&apos;s own image references below.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {activeClip.snaps.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() =>
+                  setSelectorSnap({ clipId: activeClip.job.id, snapId: s.id })
+                }
+                title={
+                  s.elements.some((el) => el.status === "completed")
+                    ? "Snap — selections set, edit →"
+                    : "Snap — select objects →"
+                }
+                className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-ink-650 hover:border-accent-400"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={s.frameDataUrl}
+                  alt=""
+                  className="h-full w-full object-cover"
+                />
+                {s.elements.some((el) => el.status === "completed") && (
+                  <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
 
       {/* --- Detected scenes + transfer -------------------------------------- */}
@@ -1110,47 +1148,6 @@ function ReferenceEditorInner() {
                         ? "Selections set — edit →"
                         : "Select objects →"}
                     </button>
-                    {/* Extra frames grabbed for this clip via "Take Snap" —
-                        each opens its own Select-objects pass; whatever
-                        gets saved there folds onto this clip's own prompt
-                        and image references (see saveSnapPrompt), so these
-                        aren't a separate thing to include/exclude below. */}
-                    {c.snaps.length > 0 && (
-                      <div className="flex flex-wrap gap-1 border-t border-ink-650 bg-ink-900 p-1.5">
-                        {c.snaps.map((s) => (
-                          <button
-                            key={s.id}
-                            type="button"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              setSelectorSnap({
-                                clipId: c.job.id,
-                                snapId: s.id,
-                              });
-                            }}
-                            title={
-                              s.elements.some((el) => el.status === "completed")
-                                ? "Snap — selections set, edit →"
-                                : "Snap — select objects →"
-                            }
-                            className="relative h-8 w-8 shrink-0 overflow-hidden rounded border border-ink-650 hover:border-accent-400"
-                          >
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={s.frameDataUrl}
-                              alt=""
-                              className="h-full w-full object-cover"
-                            />
-                            {s.elements.some(
-                              (el) => el.status === "completed",
-                            ) && (
-                              <span className="absolute bottom-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-accent-400" />
-                            )}
-                          </button>
-                        ))}
-                      </div>
-                    )}
                   </label>
                 );
               })}
