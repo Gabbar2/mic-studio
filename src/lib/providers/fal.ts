@@ -857,28 +857,58 @@ export const falProvider: VideoProvider = {
     // so its blast radius should stay small — the balance read prefers a
     // separate FAL_ADMIN_KEY and falls back to FAL_KEY for anyone whose key
     // already carries both scopes.
+    const usingAdminKey = !!process.env.FAL_ADMIN_KEY;
     const key = process.env.FAL_ADMIN_KEY ?? process.env.FAL_KEY;
-    if (!key) return null;
+    if (!key) {
+      console.error("[fal] getBalance: neither FAL_ADMIN_KEY nor FAL_KEY is set");
+      return null;
+    }
 
+    // Every failure path below logs — this used to return null silently on
+    // anything short of a thrown exception, which is exactly how a
+    // misconfigured key (wrong value, wrong scope, wrong account) went
+    // unnoticed for as long as it did: nothing short of opening the admin
+    // panel and noticing a suspiciously small number would ever surface it.
+    // None of these log the key itself, only which env var supplied it and
+    // its first few characters — enough to confirm "is this even shaped
+    // like a fal key" without putting the working secret in Vercel's logs.
+    const keyPreview = `${key.slice(0, 7)}…(${key.length} chars)`;
     try {
       const res = await fetch(`${REST}/v1/account/billing?expand=credits`, {
         headers: { Authorization: `Key ${key}` },
         cache: "no-store",
       });
 
-      // 401/403 means the key isn't admin-scoped. That's a permissions choice,
-      // not a fault — report unknown rather than breaking the header.
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // 401/403 here almost always means the key isn't admin-scoped, or
+        // isn't a fal key at all — report unknown (a permissions outcome,
+        // not an outage) rather than breaking the header, but log exactly
+        // what fal said so this is diagnosable from Vercel's logs alone.
+        const body = await res.text().catch(() => "<unreadable body>");
+        console.error(
+          `[fal] getBalance: ${res.status} from fal using ${usingAdminKey ? "FAL_ADMIN_KEY" : "FAL_KEY"} (${keyPreview}) — ${body.slice(0, 500)}`,
+        );
+        return null;
+      }
 
       const json = (await res.json()) as {
         credits?: { current_balance?: number; currency?: string };
       };
 
       const balance = json.credits?.current_balance;
-      if (typeof balance !== "number") return null;
+      if (typeof balance !== "number") {
+        console.error(
+          `[fal] getBalance: 200 but no credits.current_balance in response — ${JSON.stringify(json).slice(0, 500)}`,
+        );
+        return null;
+      }
 
       return { balance, currency: json.credits?.currency ?? "USD" };
-    } catch {
+    } catch (e) {
+      console.error(
+        `[fal] getBalance: request failed using ${usingAdminKey ? "FAL_ADMIN_KEY" : "FAL_KEY"} (${keyPreview})`,
+        e,
+      );
       return null;
     }
   },
