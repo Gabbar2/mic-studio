@@ -678,17 +678,53 @@ function ReferenceEditorInner() {
     };
   }
 
+  /**
+   * Combines every included clip — and each of their snaps — into exactly
+   * ONE job, instead of one job per clip. Reference → Video only ever
+   * attaches a single video, so the first included clip's own video is
+   * what carries over; but every included clip's own reference image(s)
+   * (whatever that clip's own "Select objects" edit produced, same as a
+   * single clip's snaps already fold together) are concatenated in
+   * selection order into one combined image-reference list, and every
+   * clip's own saved instruction text is concatenated the same way. The
+   * result is one generation fed by every scene's edit, in order, rather
+   * than N separate generations that only ever show one scene at a time
+   * (the old behavior — still available in spirit by just including one
+   * clip at a time and pressing Generate between each).
+   */
   async function continueInStudio() {
     if (selectedJobs.length === 0 || navigatingToStudio) return;
     setNavigatingToStudio(true);
     setError(null);
     try {
-      const finalJobs = await Promise.all(
-        clips
-          .filter((c) => included[c.job.id] !== false)
-          .map((c) => appendUnmergedSnaps(c.job, c.snaps)),
+      const includedClips = clips.filter((c) => included[c.job.id] !== false);
+      const perClipJobs = await Promise.all(
+        includedClips.map((c) => appendUnmergedSnaps(c.job, c.snaps)),
       );
-      writeReferenceTransfer(finalJobs);
+
+      const [firstJob, ...restJobs] = perClipJobs;
+      const combinedImageUrls = perClipJobs
+        .flatMap((j) => j.referenceImageUrls)
+        .slice(0, model.maxReferences);
+      const combinedPrompt = perClipJobs
+        .map((j) => j.prompt.trim())
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+
+      const mergedJob: ReferenceTransferJob = {
+        ...firstJob,
+        referenceImageUrls: combinedImageUrls,
+        prompt: combinedPrompt,
+      };
+      // restJobs' own videos are deliberately dropped — only one video
+      // reference can ever be attached, so the first included clip's video
+      // is the one that reaches Studio; the rest contribute images and
+      // prompt text only. Named here (rather than left implicit) so a
+      // future "which clip's video should lead?" picker has an obvious
+      // place to plug in instead of this always silently picking "first".
+      void restJobs;
+
+      writeReferenceTransfer([mergedJob]);
       // A full browser navigation, not router.push — Studio's mount effect
       // (the one that reads the prepared clips back out of sessionStorage)
       // only ever runs once, on mount. If Studio was already visited earlier
@@ -1236,13 +1272,13 @@ function ReferenceEditorInner() {
               {navigatingToStudio ? "Opening Studio…" : "Continue in Mic Studio →"}
             </button>
             <p className="text-center text-[11px] text-ink-400">
-              Opens Studio with {model?.label} and{" "}
+              Opens Studio with {model?.label} already loaded into Reference
+              mode:{" "}
               {selectedJobs.length === 1
-                ? "the selected clip"
-                : "the first selected clip"}{" "}
-              already loaded into Reference mode. Nothing generates and no
-              credit is spent until you review it there and press Generate
-              yourself.
+                ? "the selected clip's video and its own reference image(s)."
+                : `the first selected clip's video, with all ${selectedJobs.length} selected clips' reference images combined in order.`}{" "}
+              Nothing generates and no credit is spent until you review it
+              there and press Generate yourself.
             </p>
           </div>
         )}
