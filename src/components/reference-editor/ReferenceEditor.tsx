@@ -1,1316 +1,1716 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import TrimTimeline from "./TrimTimeline";
-import SceneObjectSelector from "./SceneObjectSelector";
-import ConsentCheckbox, {
-  UploadConsentProvider,
-  useUploadConsent,
-} from "@/components/UploadConsent";
+import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { uploadMedia } from "@/lib/upload";
-import { extractClip, planScenesFromCuts } from "@/lib/videoClip";
-import { detectSceneCuts } from "@/lib/sceneDetect";
 import { captureThumbnail } from "@/lib/videoThumbnail";
-import { loadFfmpeg } from "@/lib/ffmpegLoader";
 import {
-  writeReferenceTransfer,
-  type ReferenceTransferJob,
-} from "@/lib/referenceTransfer";
-import type { ElementRecord } from "@/lib/promptCombiner";
-import { extractYouTubeVideoId, type YouTubeLicense } from "@/lib/youtube";
+  buildCombinedPrompt,
+  type ElementAttachment,
+  type ElementRecord,
+} from "@/lib/promptCombiner";
 
-/**
- * Sites that hand out real, directly-linkable video files — unlike YouTube,
- * pasting one of these straight into the URL field just works, no license
- * gate needed, because that's what these sites are built for. Shown as
- * their own expand-a-search-field buttons next to "Paste YouTube URL",
- * since a YouTube link search only ever ends in "now go download it
- * elsewhere" (see the YouTube panel below) while these end in "paste the
- * link, done".
- */
-const FOOTAGE_SITES = [
-  {
-    key: "pexels",
-    label: "Pexels",
-    searchUrl: (q: string) =>
-      `https://www.pexels.com/search/videos/${encodeURIComponent(q)}/`,
-  },
-  {
-    key: "pixabay",
-    label: "Pixabay",
-    searchUrl: (q: string) =>
-      `https://pixabay.com/videos/search/${encodeURIComponent(q)}/`,
-  },
-] as const;
-import {
-  MODELS,
-  getModel,
-  durationsFor,
-  qualitiesFor,
-  resolutionFor,
-  referenceVideoCapSeconds,
-  type AspectRatio,
-} from "@/lib/models";
-
-const REFERENCE_MODELS = MODELS.filter((m) => m.supportsReferenceVideo);
-
-interface SourceMeta {
-  durationSeconds: number;
-  width: number;
-  height: number;
-  sizeBytes: number | null;
+interface PendingMask {
+  maskUrl: string;
   name: string;
+  score: number | null;
 }
 
-function fmtBytes(n: number | null): string {
-  if (n == null) return "unknown size";
-  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+/** A manually dragged rectangle, in 0–1 fractions of the frame image — not
+ * pixels, so it stays correct regardless of how large the frame is rendered
+ * on screen. */
+interface DragRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
 }
 
-function guessAspectRatio(width: number, height: number): AspectRatio {
-  const r = width / height;
-  if (r > 1.2) return "16:9";
-  if (r < 0.83) return "9:16";
-  return "1:1";
+function normalizeRect(r: DragRect) {
+  return {
+    left: Math.min(r.x0, r.x1),
+    top: Math.min(r.y0, r.y1),
+    right: Math.max(r.x0, r.x1),
+    bottom: Math.max(r.y0, r.y1),
+  };
 }
 
-type Stage = "empty" | "loaded" | "preparing" | "ready";
+/** A point in a freehand (pencil) stroke, same 0–1 fraction convention as
+ * DragRect. */
+interface Point {
+  x: number;
+  y: number;
+}
+
+/** A finished manual selection waiting to be named — either shape rasterizes
+ * to a mask the same way everything downstream (highlight overlay, the
+ * element record) is already built to consume. */
+type ManualShape =
+  | { kind: "box"; rect: DragRect }
+  | { kind: "pencil"; points: Point[] };
+
+/** One bubble in a per-element edit chat — either the person's own typed
+ * instruction, or the actual edited frame that came back for it (real or
+ * mock; `mock` is only set on a freshly-generated result, never on one
+ * reconstructed from a reopened element — see openEditor). */
+type EditorMessage =
+  | { id: string; role: "user"; text: string }
+  | { id: string; role: "result"; imageUrl: string; mock?: boolean }
+  // A system-style note (e.g. "↻ regenerated the selection") — shown in the
+  // thread for context but never counted as an instruction: excluded from
+  // the text saveEditor folds into rawPrompt, and from what regenerateSelection
+  // treats as "the last thing typed".
+  | { id: string; role: "note"; text: string };
+
+/** Bounding box of a freehand stroke, in the same shape normalizeRect
+ * returns, so both shapes can share one minimum-size check. */
+function pointsBounds(points: Point[]) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  return {
+    left: Math.min(...xs),
+    top: Math.min(...ys),
+    right: Math.max(...xs),
+    bottom: Math.max(...ys),
+  };
+}
 
 /**
- * An extra still frame grabbed from the trim timeline's "Take Snap" button
- * — a quick way to pull a second (or third…) specific frame out of a clip
- * to run through its own "Select objects & backgrounds" pass, without
- * re-trimming and re-encoding a whole new clip just to get one still. Not a
- * destination of its own: whatever gets edited on a snap is folded onto its
- * parent clip's own job (prompt + image references) once saved — see
- * saveSnapPrompt — so a clip can end up with references from its own
- * auto-captured frame AND from one or more snaps, all combined.
+ * Distinct, colorblind-friendlyish hues so several elements read as separate
+ * highlights at a glance rather than one blob. Cycles if there are more
+ * elements than colors — unlikely for a handful per clip, and a repeat is
+ * harmless (the label still disambiguates).
  */
-interface SnapRecord {
-  id: string;
-  /** Where in the source clip this was taken from — drives the 📍 marker
-   * TrimTimeline draws on the track for it. */
-  atSeconds: number;
-  frameDataUrl: string;
-  frameWidth: number;
-  frameHeight: number;
-  /** Dataset 1 for this snap's own multi-element editing — same shape and
-   * same reason it lives outside SceneObjectSelector as PreparedClip's own
-   * `elements` field (see below). */
+const HIGHLIGHT_COLORS = [
+  "#22d3ee", // cyan
+  "#f472b6", // pink
+  "#facc15", // yellow
+  "#a78bfa", // violet
+  "#fb923c", // orange
+  "#4ade80", // green
+];
+
+/**
+ * Multi-element editing for one prepared scene clip: find/mark a region
+ * (AI-detected, tapped from an auto-suggestion pill, or hand-drawn), then —
+ * separately, per element — write what should happen to it and attach its
+ * own reference media. Every selected element is tracked as its own
+ * `ElementRecord` ("Dataset 1" in the spec this was built from); on Done,
+ * every *completed* element (one with a saved instruction) is folded by
+ * `buildCombinedPrompt` (lib/promptCombiner.ts) into one combined prompt +
+ * attachment list ("Dataset 2") handed back to the Reference Editor.
+ *
+ * `elements` is a controlled prop, not local state: this component remounts
+ * every time its clip's modal is reopened (see ReferenceEditor's
+ * `{selectorClip && meta && (<SceneObjectSelector .../>)}`), and the spec
+ * explicitly requires returning to an already-configured element without
+ * losing its data — so the array itself, and every element's attachments
+ * and instruction, live on the parent (`PreparedClip.elements`) and simply
+ * survive this component unmounting.
+ *
+ * Finding a region, two ways:
+ *  - Describing what to select, not clicking it: SAM 3 is a *text-concept*
+ *    segmentation model, not classic click-anywhere SAM — a point alone,
+ *    with no description, silently fell back to fal's own default search
+ *    concept and never found anything on a real frame. Typing a short
+ *    phrase ("the red jacket", "the dog") is what the model needs, and
+ *    becomes the element's starting label.
+ *  - "Draw manually" (box or freehand pencil) is a separate, entirely
+ *    client-side path — not a fal call at all. SAM 3 can miss a concept
+ *    outright ("grapefruit" finding nothing) or lump distinct objects into
+ *    one mask ("fruit" matching everything fruit-shaped at once); a person
+ *    drawing exactly what they mean is the reliable fallback. The shape is
+ *    rasterized straight into a mask image in the browser and treated
+ *    identically to an AI-found mask everywhere after that.
+ *
+ * optimizedPrompt is a pass-through of what the user typed in the per-
+ * element editor — see the longer note in lib/promptCombiner.ts on why
+ * there's no live OpenAI call here yet.
+ */
+export default function SceneObjectSelector({
+  sourceUrl,
+  sourceWidth,
+  sourceHeight,
+  clipStart,
+  clipEnd,
+  presetFrameDataUrl,
+  elements,
+  onElementsChange,
+  granted,
+  onClose,
+  onSave,
+}: {
+  sourceUrl: string;
+  sourceWidth: number;
+  sourceHeight: number;
+  clipStart: number;
+  clipEnd: number;
+  /** When set (a "Take Snap" still, already captured at a specific moment
+   * the person scrubbed to), this exact frame is used directly instead of
+   * extracting one from sourceUrl via clipStart/clipEnd's midpoint — see
+   * the prepareFrame effect below. sourceUrl/clipStart/clipEnd are still
+   * required by the type (and still used for the Dataset 1 record's own
+   * sourceFrameSeconds bookkeeping) even in this case. sourceWidth/
+   * sourceHeight should be this frame's own pixel size when this is set,
+   * not the parent clip's. */
+  presetFrameDataUrl?: string | null;
   elements: ElementRecord[];
-  /** True once this snap's edits have been folded onto its parent clip's
-   * job via saveSnapPrompt. A snap that was only ever taken — never opened
-   * in "Select objects" — stays false forever, which is how
-   * continueInStudio (below) knows it still needs to upload that snap's
-   * raw frameDataUrl and append it as its own reference, rather than
-   * assuming every snap already made it into referenceImageUrls. */
-  mergedIntoClip: boolean;
-}
+  onElementsChange: (
+    updater: (prev: ElementRecord[]) => ElementRecord[],
+  ) => void;
+  granted: boolean;
+  onClose: () => void;
+  onSave: (result: { prompt: string; referenceImageUrls: string[] }) => void;
+}) {
+  const elementSeq = useRef(0);
+  const attachmentSeq = useRef(0);
+  const frameSeq = useRef(0);
+  const frameBoxRef = useRef<HTMLDivElement | null>(null);
 
-interface PreparedClip {
-  job: ReferenceTransferJob;
-  start: number;
-  end: number;
-  thumbnail: string | null;
-  /**
-   * Dataset 1 for this clip's multi-element editing — lives here, not as
-   * local state inside SceneObjectSelector, specifically so it survives
-   * that modal unmounting when the user closes and reopens it for the same
-   * clip. In-memory only (no backing table): cleared on a full page reload,
-   * same lifetime as everything else in this editor.
-   */
-  elements: ElementRecord[];
-  /** Extra frames grabbed via "Take Snap" while this clip was the most
-   * recently prepared one — see SnapRecord above. */
-  snaps: SnapRecord[];
-}
-
-export default function ReferenceEditor() {
-  return (
-    <UploadConsentProvider>
-      <ReferenceEditorInner />
-    </UploadConsentProvider>
-  );
-}
-
-function ReferenceEditorInner() {
-  const { granted } = useUploadConsent();
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const urlInputRef = useRef<HTMLInputElement>(null);
-  // A plain incrementing counter rather than Date.now()/crypto.randomUUID() —
-  // both read impure/nondeterministic sources the lint rules for component
-  // purity flag even from inside an event handler defined in the component
-  // body. A ref mutated only in response to a click is exactly what refs are
-  // for.
-  const jobSeq = useRef(0);
-  const snapSeq = useRef(0);
-
-  const [stage, setStage] = useState<Stage>("empty");
-  const [sourceFile, setSourceFile] = useState<File | null>(null);
-  const [sourceUrl, setSourceUrl] = useState<string>("");
-  const [meta, setMeta] = useState<SourceMeta | null>(null);
-  const [modelId, setModelId] = useState(REFERENCE_MODELS[0]?.id ?? "");
-  const [range, setRange] = useState({ start: 0, end: 0 });
-  const [dragging, setDragging] = useState(false);
+  const [frameDataUrl, setFrameDataUrl] = useState<string | null>(null);
+  const [frameSize, setFrameSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [loadingFrame, setLoadingFrame] = useState(true);
+  const [describeText, setDescribeText] = useState("");
+  const [segmenting, setSegmenting] = useState(false);
+  const [pending, setPending] = useState<PendingMask | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [prepareLabel, setPrepareLabel] = useState("");
-  const [prepareProgress, setPrepareProgress] = useState(0);
-  const [clips, setClips] = useState<PreparedClip[]>([]);
-  // Which prepared scene clips are checked to go on to Studio — keyed by
-  // job id rather than index, so it survives clips being added one at a
-  // time as detection/trimming works through the list. Absence of a key
-  // means "included": a clip is on by default the moment it appears, with
-  // no flash of being unchecked first.
-  const [included, setIncluded] = useState<Record<string, boolean>>({});
-  // Which clip's object/background selector is open — null when closed.
-  // Only one at a time; the selector is a full-screen modal.
-  const [selectorClipId, setSelectorClipId] = useState<string | null>(null);
-  // Same idea, one level down — which snap's own selector is open. Separate
-  // from selectorClipId rather than a union of the two, since a clip's own
-  // selector and one of its snaps' selectors are opened from different UI
-  // (the "Select objects →" button vs. a snap thumbnail) and saved through
-  // different paths (savePromptForClip replaces the job's prompt/refs;
-  // saveSnapPrompt merges onto whatever's already there — see both below).
-  const [selectorSnap, setSelectorSnap] = useState<{
-    clipId: string;
-    snapId: string;
-  } | null>(null);
-  // True from the moment "Continue in Mic Studio" is clicked until the
-  // browser actually navigates away (or the handoff fails) — guards against
-  // a second click re-running the upload-and-navigate work (and, since
-  // clicking again mid-navigation did nothing visible before, made it look
-  // like the first click hadn't registered).
-  const [navigatingToStudio, setNavigatingToStudio] = useState(false);
+  const [candidates, setCandidates] = useState<string[]>([]);
+  const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [pillBusy, setPillBusy] = useState<string | null>(null);
+  const nextColor = (count: number) =>
+    HIGHLIGHT_COLORS[count % HIGHLIGHT_COLORS.length];
 
-  // A pasted YouTube link never loads as a direct video regardless of its
-  // license — YouTube blocks that outside its own player — so instead of
-  // letting it fail with the generic playback error, this checks the
-  // video's declared license first and explains whether it's even legally
-  // reusable, then disables the field either way (see handleUrlSubmit).
-  const [checkingLicense, setCheckingLicense] = useState(false);
-  const [licenseNotice, setLicenseNotice] = useState<{
-    license: YouTubeLicense;
-    message: string;
-  } | null>(null);
-  const [urlFieldBlocked, setUrlFieldBlocked] = useState(false);
-  // Reused for whichever footage-site panel (Pexels, Pixabay, …) is
-  // currently open — only one can be open at a time, so one field is
-  // enough rather than one per site.
-  const [siteQuery, setSiteQuery] = useState("");
-  // True once the person has clicked "Go ↗" and actually been sent to the
-  // open footage-site panel's site — the "Downloaded it? Upload the file"
-  // button below the search box only appears then, since there's nothing to
-  // upload until they've been there and downloaded a clip.
-  const [siteVisited, setSiteVisited] = useState(false);
-  // The empty-state media box starts on a row of buttons — Choose a video,
-  // Paste YouTube URL, one per FOOTAGE_SITES entry — and swaps to whichever
-  // one was clicked, hiding the buttons in favor of that one expanded
-  // field. "← Back" returns to the button row and clears whatever was in
-  // progress.
-  const [mediaInputMode, setMediaInputMode] = useState<
-    "buttons" | "paste" | (typeof FOOTAGE_SITES)[number]["key"]
-  >("buttons");
+  // Manual drawing fallback — see the component doc comment above. "box" vs
+  // "pencil" picks the stroke shape; "add"/"subtract" (the two boolean-op
+  // buttons) picks how each finished stroke combines into the selection
+  // being built — several strokes, of either shape, fold together onto one
+  // accumulator canvas (manualAccumCanvasRef) before it's named and turned
+  // into an element, the same way Photoshop/Figma's add/subtract selection
+  // modes work. `pendingMaskUrl` is a snapshot of that accumulator after
+  // the most recent stroke — both what the naming UI confirms and what's
+  // shown as a live highlight on the frame while more strokes are added.
+  const [manualMode, setManualMode] = useState(false);
+  const [drawShape, setDrawShape] = useState<"box" | "pencil">("box");
+  const [manualCombineMode, setManualCombineMode] = useState<
+    "add" | "subtract"
+  >("add");
+  const [dragRect, setDragRect] = useState<DragRect | null>(null);
+  const [freehandPoints, setFreehandPoints] = useState<Point[] | null>(null);
+  const [pendingMaskUrl, setPendingMaskUrl] = useState<string | null>(null);
+  const manualAccumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [manualName, setManualName] = useState("");
+  const draggingRef = useRef(false);
 
-  const model = getModel(modelId) ?? REFERENCE_MODELS[0];
-  const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
+  // Per-element editor — opened by the ✨ icon on a list row, styled as a
+  // small chat so writing, re-reading, and revising an instruction feels
+  // like a running conversation about this one element rather than a
+  // single-shot form. Drafted separately from `elements` so Cancel can
+  // discard changes cleanly. There's no model replying in this thread (see
+  // lib/promptCombiner.ts's pass-through note) — every bubble here is the
+  // person's own message; "sending" one just appends it to the instruction
+  // text that gets saved.
+  const [editingElementId, setEditingElementId] = useState<string | null>(
+    null,
+  );
+  const [draftLabel, setDraftLabel] = useState("");
+  const [draftMessages, setDraftMessages] = useState<EditorMessage[]>([]);
+  const [composeText, setComposeText] = useState("");
+  const [draftAttachments, setDraftAttachments] = useState<
+    ElementAttachment[]
+  >([]);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
+  // The most recent actual edited frame from this chat (real or mock) —
+  // what Save writes onto the element as `generatedImageUrl`. Separate from
+  // `draftMessages` (which is just the thread for display) so Save doesn't
+  // have to go hunting backward through the thread for the last result
+  // bubble.
+  const [lastGeneratedUrl, setLastGeneratedUrl] = useState<string | null>(
+    null,
+  );
+  const [generating, setGenerating] = useState(false);
+  const messageSeq = useRef(0);
+  const editingElement =
+    elements.find((e) => e.elementId === editingElementId) ?? null;
 
-  const loadSource = useCallback((file: File | null, remoteUrl: string) => {
-    setError(null);
-    setClips([]);
-    setIncluded({});
-    setStage("empty");
-    setSourceFile(file);
+  const [showIncompleteWarning, setShowIncompleteWarning] = useState(false);
 
-    const objectUrl = file ? URL.createObjectURL(file) : remoteUrl;
-    setSourceUrl(objectUrl);
+  useEffect(() => {
+    let cancelled = false;
 
-    const probe = document.createElement("video");
-    probe.preload = "metadata";
-    probe.muted = true;
-    probe.crossOrigin = "anonymous";
-    probe.onloadedmetadata = () => {
-      const durationSeconds = probe.duration;
-      const next: SourceMeta = {
-        durationSeconds,
-        width: probe.videoWidth,
-        height: probe.videoHeight,
-        sizeBytes: file?.size ?? null,
-        name: file?.name ?? remoteUrl,
-      };
-      setMeta(next);
-      setRange({ start: 0, end: durationSeconds });
-      setStage("loaded");
-    };
-    probe.onerror = () => {
-      setError(
-        "Could not read that video. If it's a pasted URL, the host may be blocking playback here — try uploading the file instead.",
-      );
-    };
-    probe.src = objectUrl;
-  }, []);
+    async function prepareFrame() {
+      setLoadingFrame(true);
+      setError(null);
+      try {
+        // Capped at 960px wide and kept at the source's own aspect ratio —
+        // stretching to a fixed box would distort the frame fal actually
+        // sees, which is otherwise unnecessary: this app's reference clips
+        // are already 16:9/9:16/1:1, so the source's own ratio is already
+        // one of those.
+        const width = 960;
+        const height = Math.max(
+          1,
+          Math.round((width * (sourceHeight || 1)) / (sourceWidth || 1)),
+        );
+        const dataUrl = presetFrameDataUrl
+          ? presetFrameDataUrl
+          : await captureThumbnail(
+              sourceUrl,
+              (clipStart + clipEnd) / 2,
+              width,
+              height,
+            );
+        if (!dataUrl) {
+          throw new Error(
+            "Could not capture a frame from this clip to select from.",
+          );
+        }
+        if (cancelled) return;
+        setFrameDataUrl(dataUrl);
+        setFrameSize({ width, height });
 
-  /**
-   * Routes a pasted URL to the right path before touching the video
-   * element at all. A YouTube link skips loadSource entirely — it would
-   * only fail there with a generic error — and instead gets checked
-   * against YouTube's own declared license via /api/youtube-license:
-   *  - Creative Commons: told they're free to reuse it, but still pointed
-   *    at downloading it through a legitimate route and using "Choose a
-   *    video" — a CC license is permission to reuse, not a technical
-   *    download path this app (or YouTube itself) provides.
-   *  - Standard license, or unreadable (private/deleted/lookup failed):
-   *    told plainly they likely don't have the right to reuse it.
-   * Either way the field is disabled afterward — a YouTube link can never
-   * proceed through this field, only the specific guidance differs. Any
-   * other URL (a direct video file) goes through loadSource exactly as
-   * before this check existed.
-   */
-  async function handleUrlSubmit(url: string) {
-    const videoId = extractYouTubeVideoId(url);
-    if (!videoId) {
-      loadSource(null, url);
-      return;
+        const blob = await (await fetch(dataUrl)).blob();
+        frameSeq.current += 1;
+        const file = new File([blob], `frame-${frameSeq.current}.jpg`, {
+          type: "image/jpeg",
+        });
+        const url = await uploadMedia(file, "image", granted);
+        if (cancelled) return;
+        setFrameUrl(url);
+      } catch (e) {
+        if (!cancelled) {
+          setError(
+            e instanceof Error ? e.message : "Could not prepare this frame.",
+          );
+        }
+      } finally {
+        if (!cancelled) setLoadingFrame(false);
+      }
     }
 
+    void prepareFrame();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceUrl, clipStart, clipEnd, presetFrameDataUrl]);
+
+  // Auto-detect pills: a best-effort suggestion list, so most of the time
+  // nobody has to type a description from scratch at all. Deliberately
+  // separate from the frame-prep effect above and from the blocking `error`
+  // state — Florence-2 having a bad moment, or finding nothing, should never
+  // stop the rest of the selector from working; it just means the pill row
+  // stays empty and manual typing is still right there.
+  useEffect(() => {
+    if (!frameUrl) return;
+    let cancelled = false;
+
+    (async () => {
+      setLoadingCandidates(true);
+      setCandidates([]);
+      try {
+        const res = await fetch("/api/detect-labels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageUrl: frameUrl }),
+        });
+        const json = (await res.json()) as { labels?: unknown };
+        if (!cancelled && res.ok && Array.isArray(json.labels)) {
+          setCandidates(
+            json.labels.filter((l): l is string => typeof l === "string"),
+          );
+        }
+      } catch {
+        // Best-effort — see comment above.
+      } finally {
+        if (!cancelled) setLoadingCandidates(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [frameUrl]);
+
+  /** Creates a new element record from a found/drawn mask and hands it to
+   * the parent — the single path every detection method (typed, pill,
+   * manual) funnels through, so id/color/timestamp assignment only lives in
+   * one place. */
+  function addElement(
+    label: string,
+    maskUrl: string,
+    confidence: number | null,
+  ) {
+    elementSeq.current += 1;
+    const elementId = `element_${String(elementSeq.current).padStart(3, "0")}`;
+    const now = new Date().toISOString();
+    onElementsChange((prev) => [
+      ...prev,
+      {
+        elementId,
+        label,
+        color: nextColor(prev.length),
+        maskUrl,
+        highlightPreviewUrl: maskUrl,
+        sourceFrameSeconds: (clipStart + clipEnd) / 2,
+        detectionConfidence: confidence,
+        rawPrompt: "",
+        optimizedPrompt: "",
+        attachments: [],
+        generatedImageUrl: null,
+        status: "not_started",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+  }
+
+  function removeElement(elementId: string) {
+    onElementsChange((prev) => prev.filter((e) => e.elementId !== elementId));
+    if (editingElementId === elementId) setEditingElementId(null);
+  }
+
+  function elementForLabel(label: string) {
+    const needle = label.trim().toLowerCase();
+    return elements.find((e) => e.label.trim().toLowerCase() === needle);
+  }
+
+  async function handleDetect() {
+    const text = describeText.trim();
+    if (!frameUrl || !text || segmenting) return;
+
+    setSegmenting(true);
     setError(null);
-    setLicenseNotice(null);
-    setCheckingLicense(true);
+    setPending(null);
     try {
-      const res = await fetch("/api/youtube-license", {
+      const res = await fetch("/api/segment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ imageUrl: frameUrl, prompt: text }),
       });
       const json = (await res.json()) as {
-        license?: YouTubeLicense;
+        maskUrl?: string;
+        score?: number;
         error?: string;
       };
-      if (!res.ok || !json.license) {
-        throw new Error(json.error ?? "Could not check that video's license.");
+      if (!res.ok || !json.maskUrl) {
+        throw new Error(json.error ?? "Could not detect that.");
       }
-
-      const message =
-        json.license === "creativeCommon"
-          ? "This video is marked Creative Commons — you're free to reuse it. YouTube still won't let this app load it directly, though: download it through YouTube's own download option (if the creator enabled it) or another legitimate source, then use “Choose a video” above."
-          : "This video has a standard YouTube license (or its license couldn't be confirmed), so you likely don't have the right to reuse it. This app won't process a YouTube link either way — paste or upload a video you have the rights to use instead.";
-
-      setLicenseNotice({ license: json.license, message });
-      setUrlFieldBlocked(true);
+      setPending({
+        maskUrl: json.maskUrl,
+        name: text,
+        score: typeof json.score === "number" ? json.score : null,
+      });
     } catch (e) {
-      setError(
-        e instanceof Error ? e.message : "Could not check that video's license.",
-      );
+      setError(e instanceof Error ? e.message : "Could not detect that.");
     } finally {
-      setCheckingLicense(false);
+      setSegmenting(false);
     }
   }
 
-  function resetUrlField() {
-    setLicenseNotice(null);
-    setUrlFieldBlocked(false);
-    setError(null);
-    if (urlInputRef.current) urlInputRef.current.value = "";
+  function keepPending() {
+    if (!pending) return;
+    addElement(pending.name, pending.maskUrl, pending.score);
+    setPending(null);
+    setDescribeText("");
   }
 
-  function backToMediaButtons() {
-    resetUrlField();
-    setSiteQuery("");
-    setSiteVisited(false);
-    setMediaInputMode("buttons");
+  /** 0–1 fraction of the frame image under a pointer event, clamped so a
+   * drag that leaves the image (e.g. onto the letterbox bars) still resolves
+   * to a valid point instead of going out of bounds. */
+  function fractionFromEvent(e: PointerEvent): { x: number; y: number } {
+    const box = frameBoxRef.current?.getBoundingClientRect();
+    if (!box || box.width === 0 || box.height === 0) return { x: 0, y: 0 };
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - box.top) / box.height)),
+    };
   }
 
-  async function handlePrepare() {
-    if (!model || !meta || !sourceUrl) return;
-    if (!granted) {
-      setError("Tick the confirmation above first.");
+  function startManualDraw(e: PointerEvent) {
+    if (!manualMode) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
+    const p = fractionFromEvent(e);
+    if (drawShape === "box") {
+      setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+    } else {
+      setFreehandPoints([p]);
+    }
+  }
+
+  function moveManualDraw(e: PointerEvent) {
+    if (!draggingRef.current) return;
+    const p = fractionFromEvent(e);
+    if (drawShape === "box") {
+      setDragRect((prev) => (prev ? { ...prev, x1: p.x, y1: p.y } : prev));
+    } else {
+      setFreehandPoints((prev) => {
+        if (!prev) return prev;
+        // Skip near-duplicate points (a stationary or slow-moving pointer
+        // firing many move events) — keeps the point count, and therefore
+        // the eventual mask path, sane without a visible difference.
+        const last = prev[prev.length - 1];
+        if (
+          last &&
+          Math.abs(last.x - p.x) < 0.004 &&
+          Math.abs(last.y - p.y) < 0.004
+        ) {
+          return prev;
+        }
+        return [...prev, p];
+      });
+    }
+  }
+
+  function endManualDraw() {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    if (drawShape === "box") {
+      setDragRect((prev) => {
+        if (!prev) return null;
+        const r = normalizeRect(prev);
+        // Ignore an accidental tap/click — require a real drag.
+        if (r.right - r.left < 0.02 || r.bottom - r.top < 0.02) return null;
+        commitManualStroke({ kind: "box", rect: prev });
+        return null;
+      });
+    } else {
+      setFreehandPoints((prev) => {
+        if (!prev || prev.length < 3) return null;
+        const b = pointsBounds(prev);
+        // Same accidental-tap guard as the box tool.
+        if (b.right - b.left < 0.02 && b.bottom - b.top < 0.02) return null;
+        commitManualStroke({ kind: "pencil", points: prev });
+        return null;
+      });
+    }
+  }
+
+  /** Fills a finished shape's path onto whatever canvas/context the caller
+   * set up (fillStyle and compositeOperation are the caller's to control) —
+   * a box fills a rect; a pencil stroke fills the closed polygon its points
+   * trace, `closePath` connecting the last point back to the first, same as
+   * the live SVG preview already shows while drawing. Shared by both the
+   * add and subtract paths in commitManualStroke below, since painting the
+   * shape itself is identical either way — only the compositing differs. */
+  function paintShapePath(
+    ctx: CanvasRenderingContext2D,
+    shape: ManualShape,
+    size: { width: number; height: number },
+  ) {
+    if (shape.kind === "box") {
+      const r = normalizeRect(shape.rect);
+      ctx.fillRect(
+        r.left * size.width,
+        r.top * size.height,
+        (r.right - r.left) * size.width,
+        (r.bottom - r.top) * size.height,
+      );
+    } else {
+      const [first, ...rest] = shape.points;
+      ctx.beginPath();
+      ctx.moveTo(first.x * size.width, first.y * size.height);
+      for (const p of rest) {
+        ctx.lineTo(p.x * size.width, p.y * size.height);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  /**
+   * Paints one finished box/pencil stroke onto the running selection being
+   * built — manualAccumCanvasRef, created lazily and kept alive across
+   * strokes until the selection is named (confirmManualSelection) or
+   * abandoned (resetManualSelection). The very first stroke of a fresh
+   * selection always adds, regardless of which combine button is active —
+   * subtracting from nothing would just be a confusing no-op — every stroke
+   * after that follows manualCombineMode: "add" paints in normal
+   * source-over (white-on-white still reads as the same opaque selection,
+   * so overlapping an existing region back in is harmless), "subtract"
+   * paints with destination-out, which erases wherever the new shape's
+   * alpha is set regardless of its fill color, carving it out of whatever
+   * was already there.
+   */
+  function commitManualStroke(shape: ManualShape) {
+    if (!frameSize) return;
+    let canvas = manualAccumCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      canvas.width = frameSize.width;
+      canvas.height = frameSize.height;
+      manualAccumCanvasRef.current = canvas;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      setError("Could not create that selection — try again.");
       return;
     }
-
-    // Deliberately does NOT clear `clips`/`included` here — this can run
-    // again after a person has already prepared one selection (they adjust
-    // the trim range and hit "Prepare clip(s)" again to add more scenes),
-    // and wiping the list on every run would silently throw away clips they
-    // already reviewed and kept. Each run's new clips are appended below
-    // instead. "Replace video" (above) is the one place that still clears
-    // everything, since that's swapping the source entirely.
-    setStage("preparing");
-    setError(null);
-    // Tracked separately from the `clips` state (which this closure can
-    // only see as of the render that started this run) so the catch below
-    // knows whether THIS run added anything before failing, even if
-    // `clips` itself was still empty when the run began.
-    let addedThisRun = 0;
-
-    try {
-      // Remote URLs need their actual bytes for ffmpeg — a local File
-      // already has them. Done only now, not when the URL was first pasted,
-      // so a person previewing several candidate clips isn't downloading
-      // every one of them in full before picking one.
-      const sourceBlob: Blob = sourceFile
-        ? sourceFile
-        : await (async () => {
-            setPrepareLabel("Fetching source video…");
-            const res = await fetch(sourceUrl);
-            if (!res.ok) {
-              throw new Error(
-                "Could not download that URL from here — the host may be blocking cross-site requests. Try uploading the file instead.",
-              );
-            }
-            return res.blob();
-          })();
-
-      // Loaded explicitly, up front, and labeled on its own — a ~30 MB
-      // engine download the first time it's used is a different kind of
-      // wait than the encode that follows, and showing one spinner for both
-      // made a slow-but-fine download look like a stuck encode (see the
-      // console logs this now also prints — open DevTools if this step ever
-      // needs diagnosing again). Already cached after the first clip, so
-      // this resolves instantly for every segment after the first.
-      setPrepareLabel("Loading the trimming engine (first time only)…");
-      await loadFfmpeg();
-
-      // Scene detection runs on the already-selected range only, not the
-      // whole upload — the person drew that range on purpose, and scanning
-      // past it would both waste time and could pull in cuts they deliberately
-      // trimmed away.
-      setPrepareLabel("Finding scenes in your selection…");
-      setPrepareProgress(0);
-      const cuts = await detectSceneCuts(
-        sourceBlob,
-        range.start,
-        range.end,
-        0.35,
-        setPrepareProgress,
-      );
-
-      const segments = planScenesFromCuts(
-        cuts,
-        range.start,
-        range.end,
-        capSeconds || Infinity,
-      );
-      const aspectRatio = guessAspectRatio(meta.width, meta.height);
-
-      for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        setPrepareLabel(
-          segments.length > 1
-            ? `Trimming scene ${i + 1} of ${segments.length}…`
-            : "Trimming your clip…",
-        );
-        setPrepareProgress(0);
-
-        const clipBlob = await extractClip(
-          sourceBlob,
-          seg.start,
-          seg.end,
-          setPrepareProgress,
-        );
-
-        setPrepareLabel(
-          segments.length > 1
-            ? `Uploading scene ${i + 1} of ${segments.length}…`
-            : "Uploading your clip…",
-        );
-        jobSeq.current += 1;
-        const file = new File(
-          [clipBlob],
-          `reference-${jobSeq.current}-${i + 1}.mp4`,
-          { type: "video/mp4" },
-        );
-        const url = await uploadMedia(file, "video", granted);
-
-        const job: ReferenceTransferJob = {
-          id: `job-${jobSeq.current}`,
-          modelId: model.id,
-          referenceVideoUrl: url,
-          referenceVideoDurationSeconds: seg.end - seg.start,
-          referenceImageUrls: [],
-          prompt: "",
-          aspectRatio,
-        };
-
-        // Best-effort — a missing thumbnail just renders an empty tile
-        // rather than failing the whole prepare flow (see videoThumbnail.ts).
-        const thumbnail = await captureThumbnail(
-          sourceUrl,
-          (seg.start + seg.end) / 2,
-        );
-
-        // Appended onto whatever was already prepared — not replaced — so
-        // running this again after an earlier run keeps those clips. Shown
-        // as each one finishes rather than all at once at the end — there
-        // can now be several scenes, and watching them land one by one is a
-        // better signal of real progress than a single spinner that doesn't
-        // move until the whole batch is done.
-        setClips((prev) => [
-          ...prev,
-          {
-            job,
-            start: seg.start,
-            end: seg.end,
-            thumbnail,
-            elements: [],
-            snaps: [],
-          },
-        ]);
-        setIncluded((prev) => ({ ...prev, [job.id]: true }));
-        addedThisRun += 1;
-      }
-
-      setStage("ready");
-    } catch (e) {
-      // Logged in full, not just whatever string ends up on screen — some
-      // failures here (a Worker 'error' event, say) reject with something
-      // that isn't a standard Error, so the banner falls back to a generic
-      // message and this is the only place the real shape of what was
-      // thrown is visible at all.
-      console.error("[reference-editor] prepare failed:", e);
-      setError(e instanceof Error ? e.message : "Could not prepare the clip.");
-      // "ready" (not "loaded") whenever there's something to show — either
-      // clips already sitting there from an earlier run, or ones this run
-      // itself managed to add before hitting the error — so a failure
-      // partway through a second run doesn't hide clips already reviewed
-      // and kept.
-      setStage(clips.length > 0 || addedThisRun > 0 ? "ready" : "loaded");
-    }
+    const isFirstStroke = pendingMaskUrl === null;
+    ctx.globalCompositeOperation =
+      isFirstStroke || manualCombineMode === "add"
+        ? "source-over"
+        : "destination-out";
+    ctx.fillStyle = "#ffffff";
+    paintShapePath(ctx, shape, frameSize);
+    ctx.globalCompositeOperation = "source-over";
+    setPendingMaskUrl(canvas.toDataURL("image/png"));
   }
 
-  const selectedJobs = clips
-    .filter((c) => included[c.job.id] !== false)
-    .map((c) => c.job);
-
-  const selectorClip = clips.find((c) => c.job.id === selectorClipId) ?? null;
-
-  function savePromptForClip(
-    clipId: string,
-    result: { prompt: string; referenceImageUrls: string[] },
-  ) {
-    setClips((prev) =>
-      prev.map((c) =>
-        c.job.id === clipId
-          ? {
-              ...c,
-              job: {
-                ...c.job,
-                prompt: result.prompt,
-                referenceImageUrls: result.referenceImageUrls,
-              },
-            }
-          : c,
-      ),
-    );
-    setSelectorClipId(null);
+  /** Discards the in-progress accumulator so the next stroke starts a brand
+   * new selection — used by Cancel, Escape, and toggling manual mode off. */
+  function resetManualSelection() {
+    manualAccumCanvasRef.current = null;
+    setPendingMaskUrl(null);
   }
 
-  /** Dataset 1 updater for whichever clip's selector is currently open —
-   * passed down as SceneObjectSelector's `onElementsChange` so that
-   * component can treat its element list as a normal piece of state (via
-   * the updater-function form of setState) without knowing it's actually
-   * stored per-clip up here. */
-  function setClipElements(
-    clipId: string,
-    updater: (prev: ElementRecord[]) => ElementRecord[],
-  ) {
-    setClips((prev) =>
-      prev.map((c) =>
-        c.job.id === clipId ? { ...c, elements: updater(c.elements) } : c,
-      ),
-    );
+  function confirmManualSelection() {
+    const name = manualName.trim();
+    if (!pendingMaskUrl || !name) return;
+    addElement(name, pendingMaskUrl, null);
+    resetManualSelection();
+    setManualName("");
   }
 
   /**
-   * "Take Snap" on the trim timeline hands back a freshly captured JPEG
-   * data URL — this turns it into a SnapRecord and attaches it to whichever
-   * clip was prepared most recently (clips[clips.length - 1]), since that's
-   * "the selected clip" in the normal one-clip-at-a-time flow this was
-   * built for; TrimTimeline itself only offers the button once clips.length
-   * > 0 (see canTakeSnap below), so this should never fire with an empty
-   * list, but the guard is cheap insurance against the button briefly being
-   * stale mid-render. Decoding the data URL here (rather than asking
-   * TrimTimeline for pixel dimensions) means TrimTimeline doesn't need to
-   * know anything about SceneObjectSelector's frameWidth/frameHeight needs.
+   * One click on an auto-detected pill either adds or removes it — unlike
+   * the manual-typing path, there's no "Found X — keep it?" confirmation
+   * step here, since Florence-2 already named the object before the pill
+   * ever appeared; SAM 3 is only asked to turn that name into a mask.
    */
-  function handleTakeSnap(dataUrl: string, atSeconds: number) {
-    if (clips.length === 0) return;
-    const targetClipId = clips[clips.length - 1].job.id;
-    const img = new Image();
-    img.onload = () => {
-      snapSeq.current += 1;
-      const snap: SnapRecord = {
-        id: `snap-${snapSeq.current}`,
-        atSeconds,
-        frameDataUrl: dataUrl,
-        frameWidth: img.naturalWidth || 960,
-        frameHeight: img.naturalHeight || 540,
-        elements: [],
-        mergedIntoClip: false,
+  async function addByLabel(label: string) {
+    const existing = elementForLabel(label);
+    if (existing) {
+      removeElement(existing.elementId);
+      return;
+    }
+    if (!frameUrl || pillBusy) return;
+
+    setPillBusy(label);
+    setError(null);
+    try {
+      const res = await fetch("/api/segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: frameUrl, prompt: label }),
+      });
+      const json = (await res.json()) as {
+        maskUrl?: string;
+        score?: number;
+        error?: string;
       };
-      setClips((prev) =>
-        prev.map((c) =>
-          c.job.id === targetClipId ? { ...c, snaps: [...c.snaps, snap] } : c,
-        ),
-      );
-    };
-    img.src = dataUrl;
-  }
-
-  // Whichever clip "Take Snap" attaches new snaps to, and the trim handles
-  // lock against once it exists — always the most recently prepared one,
-  // matching the normal one-clip-at-a-time flow this was built for. Once a
-  // clip has been prepared, the trim range stays locked for good: this app
-  // doesn't offer a way to unlock it again (see TrimTimeline — no "adjust
-  // range" control), so a later clip's own range always comes from a fresh
-  // trim before its own Prepare run, not a reopened one.
-  const activeClip = clips.length > 0 ? clips[clips.length - 1] : null;
-  const trimLocked = clips.length > 0;
-  const activeClipSnapSeconds = activeClip
-    ? activeClip.snaps.map((s) => s.atSeconds)
-    : [];
-
-  const selectorSnapClip = selectorSnap
-    ? (clips.find((c) => c.job.id === selectorSnap.clipId) ?? null)
-    : null;
-  const selectorSnapRecord =
-    selectorSnapClip?.snaps.find((s) => s.id === selectorSnap?.snapId) ??
-    null;
-
-  /** Dataset 1 updater for whichever snap's selector is currently open —
-   * same role as setClipElements above, one level down. */
-  function setSnapElements(
-    clipId: string,
-    snapId: string,
-    updater: (prev: ElementRecord[]) => ElementRecord[],
-  ) {
-    setClips((prev) =>
-      prev.map((c) =>
-        c.job.id === clipId
-          ? {
-              ...c,
-              snaps: c.snaps.map((s) =>
-                s.id === snapId ? { ...s, elements: updater(s.elements) } : s,
-              ),
-            }
-          : c,
-      ),
-    );
-  }
-
-  /**
-   * A snap isn't its own destination (see SnapRecord's doc comment) — Save
-   * here folds its Dataset 2 onto the parent clip's existing job instead of
-   * replacing it the way savePromptForClip does for the clip's own
-   * selector: image references are appended (capped at the current model's
-   * own reference limit, so stacking several snaps' edits onto one clip
-   * can't silently produce more slots than Mic Studio actually has), and
-   * the prompt text is appended as a further paragraph so the snap's own
-   * instructions aren't lost.
-   */
-  function saveSnapPrompt(
-    clipId: string,
-    snapId: string,
-    result: { prompt: string; referenceImageUrls: string[] },
-  ) {
-    setClips((prev) =>
-      prev.map((c) => {
-        if (c.job.id !== clipId) return c;
-        const mergedImageUrls = [
-          ...c.job.referenceImageUrls,
-          ...result.referenceImageUrls,
-        ].slice(0, model.maxReferences);
-        const mergedPrompt = [c.job.prompt, result.prompt]
-          .map((t) => t.trim())
-          .filter((t) => t.length > 0)
-          .join("\n\n");
-        return {
-          ...c,
-          job: {
-            ...c.job,
-            referenceImageUrls: mergedImageUrls,
-            prompt: mergedPrompt,
-          },
-          snaps: c.snaps.map((s) =>
-            s.id === snapId ? { ...s, mergedIntoClip: true } : s,
-          ),
-        };
-      }),
-    );
-    setSelectorSnap(null);
-  }
-
-  /**
-   * Besides the edited snaps saveSnapPrompt already folds in, a snap that
-   * was only ever taken — never opened in "Select objects", so
-   * mergedIntoClip is still false — has nothing in referenceImageUrls yet:
-   * its only record is the raw frameDataUrl sitting in memory. This uploads
-   * each such snap's frame (same uploadMedia path a clip's own trimmed
-   * video goes through) and appends the resulting URL, capped at the
-   * model's own reference limit just like saveSnapPrompt does, so every
-   * snap taken — edited or not — ends up as a reference once the user
-   * continues to Studio.
-   */
-  async function appendUnmergedSnaps(
-    job: ReferenceTransferJob,
-    snaps: SnapRecord[],
-  ): Promise<ReferenceTransferJob> {
-    const unmerged = snaps.filter((s) => !s.mergedIntoClip);
-    if (unmerged.length === 0) return job;
-    const uploaded: string[] = [];
-    for (const s of unmerged) {
-      try {
-        const blob = await (await fetch(s.frameDataUrl)).blob();
-        const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
-        const url = await uploadMedia(file, "image", granted);
-        uploaded.push(url);
-      } catch {
-        // Best-effort — one snap failing to upload shouldn't block the
-        // rest of the handoff to Studio.
+      if (!res.ok || !json.maskUrl) {
+        throw new Error(json.error ?? `Could not detect "${label}".`);
       }
-    }
-    if (uploaded.length === 0) return job;
-    return {
-      ...job,
-      referenceImageUrls: [...job.referenceImageUrls, ...uploaded].slice(
-        0,
-        model.maxReferences,
-      ),
-    };
-  }
-
-  async function continueInStudio() {
-    if (selectedJobs.length === 0 || navigatingToStudio) return;
-    setNavigatingToStudio(true);
-    setError(null);
-    try {
-      const finalJobs = await Promise.all(
-        clips
-          .filter((c) => included[c.job.id] !== false)
-          .map((c) => appendUnmergedSnaps(c.job, c.snaps)),
+      addElement(
+        label,
+        json.maskUrl,
+        typeof json.score === "number" ? json.score : null,
       );
-      writeReferenceTransfer(finalJobs);
-      // A full browser navigation, not router.push — Studio's mount effect
-      // (the one that reads the prepared clips back out of sessionStorage)
-      // only ever runs once, on mount. If Studio was already visited earlier
-      // in this tab this session, Next's client-side router can reuse its
-      // cached render of that page instead of remounting it, which means that
-      // effect never fires again and the just-written transfer sits unread —
-      // landing on a stale Studio page with none of these clips loaded. A
-      // real navigation guarantees a fresh mount every time, at the cost of
-      // a full page reload for what's a one-time hop between two different
-      // parts of the app anyway.
-      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- deliberate: see comment above
-      window.location.href = "/studio";
     } catch (e) {
       setError(
-        e instanceof Error ? e.message : "Could not continue to Mic Studio.",
+        e instanceof Error ? e.message : `Could not detect "${label}".`,
       );
-      setNavigatingToStudio(false);
+    } finally {
+      setPillBusy(null);
     }
   }
 
-  return (
-    <div className="mx-auto max-w-3xl space-y-6 px-4 py-8 sm:px-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-white">
-          Reference Editor
-        </h1>
-        <p className="mt-1 text-sm text-ink-400">
-          Trim a source clip down to a real reference video, sized to fit
-          whichever model you&apos;ll generate with, then send it straight
-          into Mic Studio.
-        </p>
-      </div>
+  function openEditor(el: ElementRecord) {
+    setEditingElementId(el.elementId);
+    setDraftLabel(el.label);
+    // A previously saved instruction — and its generated result, if this
+    // element has one — reopens already in the thread, so coming back to an
+    // element picks the conversation back up instead of starting over.
+    const seeded: EditorMessage[] = [];
+    if (el.rawPrompt) seeded.push({ id: "seed-user", role: "user", text: el.rawPrompt });
+    if (el.generatedImageUrl) {
+      seeded.push({
+        id: "seed-result",
+        role: "result",
+        imageUrl: el.generatedImageUrl,
+      });
+    }
+    setDraftMessages(seeded);
+    setComposeText("");
+    setDraftAttachments(el.attachments);
+    setLastGeneratedUrl(el.generatedImageUrl);
+    setEditorError(null);
+  }
 
-      {/* --- 1. Media input --------------------------------------------- */}
-      {stage === "empty" && (
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragging(false);
-            const file = e.dataTransfer.files?.[0];
-            if (file) loadSource(file, "");
-          }}
-          onPaste={(e) => {
-            const file = Array.from(e.clipboardData?.files ?? [])[0];
-            if (file) {
-              e.preventDefault();
-              loadSource(file, "");
+  /**
+   * Both the header "Close" link and the footer "Cancel" button route here.
+   * Neither autosaves — only the "Save" button writes the thread back onto
+   * the element (see saveEditor) — so closing this straight after "Send"
+   * silently threw away a just-generated result if the person hadn't
+   * noticed they still needed to scroll down and press Save. This now
+   * checks for exactly that and asks first, rather than discarding
+   * something that took a real OpenAI call to produce.
+   */
+  function closeEditor() {
+    if (editingElement) {
+      const draftPrompt = [
+        ...draftMessages
+          .filter((m): m is Extract<EditorMessage, { role: "user" }> =>
+            m.role === "user",
+          )
+          .map((m) => m.text),
+        composeText.trim(),
+      ]
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+      const attachmentsChanged =
+        draftAttachments.length !== editingElement.attachments.length ||
+        draftAttachments.some(
+          (a, i) =>
+            a.attachmentId !== editingElement.attachments[i]?.attachmentId,
+        );
+      const hasUnsavedChanges =
+        draftPrompt !== editingElement.rawPrompt ||
+        lastGeneratedUrl !== editingElement.generatedImageUrl ||
+        attachmentsChanged;
+      if (
+        hasUnsavedChanges &&
+        !window.confirm(
+          "This element has a generated result or typed instruction that hasn't been saved yet. Close without saving it?",
+        )
+      ) {
+        return;
+      }
+    }
+    setEditingElementId(null);
+    setEditorError(null);
+  }
+
+  function removeEditingElement() {
+    if (!editingElementId) return;
+    // removeElement already clears editingElementId when it matches, which
+    // also closes this overlay — one path for "remove" everywhere.
+    removeElement(editingElementId);
+  }
+
+  /**
+   * Sends what's typed as a user bubble, then actually generates this
+   * element's edited frame from it via /api/edit-element — the real "edit"
+   * in edit/remove/regenerate. That route itself decides mock vs. real
+   * (the admin switch on /admin; see lib/elementEditSettings.ts), so this
+   * component never needs to know which one is active — it just renders
+   * whatever comes back, labeled if it was a mock run.
+   *
+   * Two things make a follow-up like "just one, not multiple" actually
+   * read as a follow-up instead of a fresh, unrelated instruction — OpenAI's
+   * edit endpoint has no memory between calls, it only sees whatever single
+   * image+mask+prompt this one request sends:
+   *   - `imageUrl` is the most recent generated result once there is one,
+   *     not always the original frame — so the edit lands on the apple
+   *     photo that's already on screen, not back on the untouched original.
+   *   - `prompt` resends every earlier instruction in this thread (oldest
+   *     first) plus the one just typed, joined into one block — so "with a
+   *     drone view" from two messages ago is still part of what the model
+   *     reads this time, not lost the moment the next message is sent.
+   *
+   * Nothing is written onto the element itself until Save — this only
+   * updates the thread (`draftMessages`) and `lastGeneratedUrl`, so Cancel
+   * still discards everything cleanly, same as before this call existed.
+   */
+  async function sendComposedMessage() {
+    const text = composeText.trim();
+    if (!text || generating || !editingElement || !frameUrl) return;
+
+    const priorInstructions = draftMessages
+      .filter(
+        (m): m is Extract<EditorMessage, { role: "user" }> =>
+          m.role === "user",
+      )
+      .map((m) => m.text);
+    const combinedPrompt = [...priorInstructions, text].join("\n\n");
+
+    messageSeq.current += 1;
+    const userMessage: EditorMessage = {
+      id: `msg_${messageSeq.current}`,
+      role: "user",
+      text,
+    };
+    setDraftMessages((prev) => [...prev, userMessage]);
+    setComposeText("");
+    setGenerating(true);
+    setEditorError(null);
+
+    try {
+      const res = await fetch("/api/edit-element", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageUrl: lastGeneratedUrl ?? frameUrl,
+          maskUrl: editingElement.maskUrl,
+          prompt: combinedPrompt,
+        }),
+      });
+      const json = (await res.json()) as {
+        url?: string;
+        mock?: boolean;
+        error?: string;
+      };
+      if (!res.ok || !json.url) {
+        throw new Error(json.error ?? "Could not generate that edit.");
+      }
+      messageSeq.current += 1;
+      setDraftMessages((prev) => [
+        ...prev,
+        {
+          id: `msg_${messageSeq.current}`,
+          role: "result",
+          imageUrl: json.url!,
+          mock: !!json.mock,
+        },
+      ]);
+      setLastGeneratedUrl(json.url);
+    } catch (e) {
+      setEditorError(
+        e instanceof Error ? e.message : "Could not generate that edit.",
+      );
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  /** Re-runs detection for this one element using whatever's been typed
+   * (composer first, else the latest sent message, else the label) as the
+   * new description — the "regenerate the highlighted element" half of the
+   * request. Updates the element's own mask in place, so its highlight
+   * (here and back on the main frame) and its saved selection both move to
+   * the new region without starting a new element. */
+  async function regenerateSelection() {
+    if (!editingElementId || !frameUrl || regenerating) return;
+    const lastUserText = [...draftMessages]
+      .reverse()
+      .find((m): m is Extract<EditorMessage, { role: "user" }> =>
+        m.role === "user",
+      )?.text;
+    const prompt = (composeText.trim() || lastUserText || draftLabel).trim();
+    if (!prompt) {
+      setEditorError("Type what to select before regenerating.");
+      return;
+    }
+    setRegenerating(true);
+    setEditorError(null);
+    try {
+      const res = await fetch("/api/segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: frameUrl, prompt }),
+      });
+      const json = (await res.json()) as {
+        maskUrl?: string;
+        score?: number;
+        error?: string;
+      };
+      if (!res.ok || !json.maskUrl) {
+        throw new Error(json.error ?? "Could not regenerate that selection.");
+      }
+      const maskUrl = json.maskUrl;
+      const now = new Date().toISOString();
+      onElementsChange((prev) =>
+        prev.map((e) =>
+          e.elementId === editingElementId
+            ? {
+                ...e,
+                maskUrl,
+                highlightPreviewUrl: maskUrl,
+                detectionConfidence:
+                  typeof json.score === "number" ? json.score : null,
+                updatedAt: now,
+              }
+            : e,
+        ),
+      );
+      messageSeq.current += 1;
+      setDraftMessages((prev) => [
+        ...prev,
+        {
+          id: `msg_${messageSeq.current}`,
+          role: "note",
+          text: `↻ Regenerated the highlighted selection for "${prompt}".`,
+        },
+      ]);
+    } catch (e) {
+      setEditorError(
+        e instanceof Error
+          ? e.message
+          : "Could not regenerate that selection.",
+      );
+    } finally {
+      setRegenerating(false);
+    }
+  }
+
+  /**
+   * Images only, deliberately — not the "potentially video reference later"
+   * the original spec left open. Mic Studio's reference panel has exactly
+   * one video slot total (the already-trimmed source clip itself,
+   * `referenceVideoUrl`, set once when the clip was cut) and a *list* of
+   * numbered image slots; an element's own reference attachment lands in
+   * that image list (see the Dataset2 doc comment above), which has no
+   * sensible destination for a second, unrelated video. Accepting video
+   * here would let it flow into `referenceImageUrls` and silently arrive at
+   * an image dropzone in Studio.
+   */
+  async function handleAttachmentFiles(files: FileList | null) {
+    if (!files || !files.length || !editingElementId) return;
+    setAttachmentUploading(true);
+    setEditorError(null);
+    try {
+      const uploaded: ElementAttachment[] = [];
+      for (const file of Array.from(files)) {
+        const url = await uploadMedia(file, "image", granted);
+        attachmentSeq.current += 1;
+        uploaded.push({
+          attachmentId: `attachment_${String(attachmentSeq.current).padStart(3, "0")}`,
+          elementId: editingElementId,
+          url,
+          type: "image",
+          filename: file.name,
+          thumbnail: url,
+          order: draftAttachments.length + uploaded.length,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      setDraftAttachments((prev) => [...prev, ...uploaded]);
+    } catch (e) {
+      setEditorError(
+        e instanceof Error ? e.message : "Could not upload that file.",
+      );
+    } finally {
+      setAttachmentUploading(false);
+    }
+  }
+
+  function removeDraftAttachment(attachmentId: string) {
+    setDraftAttachments((prev) =>
+      prev.filter((a) => a.attachmentId !== attachmentId),
+    );
+  }
+
+  function saveEditor() {
+    if (!editingElementId) return;
+    // Folds every sent *instruction* bubble, plus anything still sitting
+    // unsent in the composer (so a typed-but-not-"sent" line isn't silently
+    // dropped), into one instruction — in the order they were written.
+    // Result bubbles aren't text, so they're skipped here; the latest one's
+    // image is what `generatedImageUrl` below carries forward instead.
+    const prompt = [
+      ...draftMessages
+        .filter((m): m is Extract<EditorMessage, { role: "user" }> =>
+          m.role === "user",
+        )
+        .map((m) => m.text),
+      composeText.trim(),
+    ]
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+    if (!prompt) {
+      setEditorError("Write at least one message before saving.");
+      return;
+    }
+    const label = draftLabel.trim() || editingElement?.label || "Untitled";
+    const now = new Date().toISOString();
+    onElementsChange((prev) =>
+      prev.map((e) =>
+        e.elementId === editingElementId
+          ? {
+              ...e,
+              label,
+              rawPrompt: prompt,
+              // Pass-through — see lib/promptCombiner.ts's doc comment.
+              optimizedPrompt: prompt,
+              attachments: draftAttachments,
+              generatedImageUrl: lastGeneratedUrl,
+              status: "completed",
+              updatedAt: now,
             }
-          }}
-          className={`flex h-48 flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition ${
-            dragging
-              ? "border-accent-400 bg-accent-500/20"
-              : "border-accent-500/35 bg-ink-850 hover:border-accent-500/70"
-          }`}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/mp4,video/quicktime"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) loadSource(file, "");
-              e.target.value = "";
-            }}
-          />
+          : e,
+      ),
+    );
+    setEditingElementId(null);
+  }
 
-          {mediaInputMode === "buttons" && (
-            <>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="rounded-lg bg-accent-500 px-4 py-2 text-sm font-semibold text-accent-ink hover:bg-accent-400"
-              >
-                Choose a video
-              </button>
-              <p className="text-xs text-ink-400">or drag & drop, or paste</p>
-              <div className="flex flex-wrap items-center justify-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setMediaInputMode("paste")}
-                  className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
-                >
-                  Paste YouTube URL
-                </button>
-                {FOOTAGE_SITES.map((site) => (
-                  <button
-                    key={site.key}
-                    type="button"
-                    onClick={() => {
-                      setSiteVisited(false);
-                      setMediaInputMode(site.key);
-                    }}
-                    className="rounded-lg bg-accent-500 px-3.5 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400"
-                  >
-                    {site.label} ›
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
+  function finalize(list: ElementRecord[]) {
+    if (list.length === 0) {
+      onClose();
+      return;
+    }
+    const dataset2 = buildCombinedPrompt(list);
+    onSave({
+      prompt: dataset2.combinedPrompt,
+      referenceImageUrls: dataset2.attachments.map((a) => a.url),
+    });
+  }
 
-          {mediaInputMode === "paste" && (
-            <div className="flex w-full max-w-sm flex-col gap-1.5 px-4">
-              <button
-                type="button"
-                onClick={backToMediaButtons}
-                className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
-              >
-                ← Back
-              </button>
-              <div className="flex items-center gap-2">
-                <input
-                  ref={urlInputRef}
-                  type="url"
-                  autoFocus
-                  placeholder="paste a YouTube URL"
-                  disabled={urlFieldBlocked || checkingLicense}
-                  className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      const url = urlInputRef.current?.value.trim();
-                      if (url) void handleUrlSubmit(url);
-                    }
-                  }}
-                />
-                {urlFieldBlocked ? (
-                  <button
-                    type="button"
-                    onClick={resetUrlField}
-                    className="shrink-0 text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
-                  >
-                    Clear
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={checkingLicense}
-                    onClick={() => {
-                      const url = urlInputRef.current?.value.trim();
-                      if (url) void handleUrlSubmit(url);
-                    }}
-                    className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-wait disabled:opacity-60"
-                  >
-                    Go
-                  </button>
-                )}
-              </div>
+  // Wrapped defensively: onSave ultimately runs the parent's state update
+  // and closes this modal, so if anything in that chain throws, the only
+  // sign would otherwise be the modal silently staying open with the click
+  // appearing to do nothing — worth surfacing instead of swallowing.
+  function handleDone() {
+    try {
+      if (elements.length === 0) {
+        onClose();
+        return;
+      }
+      const incomplete = elements.filter((e) => e.status !== "completed");
+      if (incomplete.length > 0) {
+        setShowIncompleteWarning(true);
+        return;
+      }
+      finalize(elements);
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? `Could not save: ${e.message}`
+          : "Could not save these selections — try again.",
+      );
+    }
+  }
 
-              {checkingLicense && (
-                <p className="text-[11px] text-ink-400">
-                  Checking this video&apos;s license…
-                </p>
-              )}
+  function continueWithoutIncomplete() {
+    setShowIncompleteWarning(false);
+    finalize(elements.filter((e) => e.status === "completed"));
+  }
 
-              {licenseNotice && (
-                <p
-                  className={`rounded-lg border px-2.5 py-2 text-[11px] leading-relaxed ${
-                    licenseNotice.license === "creativeCommon"
-                      ? "border-accent-500/30 bg-accent-500/[0.08] text-ink-200"
-                      : "border-red-500/30 bg-red-500/10 text-red-300"
-                  }`}
-                >
-                  {licenseNotice.message}
-                </p>
-              )}
-            </div>
-          )}
+  const incompleteCount = elements.filter(
+    (e) => e.status !== "completed",
+  ).length;
+  const completedCount = elements.length - incompleteCount;
 
-          {FOOTAGE_SITES.map(
-            (site) =>
-              mediaInputMode === site.key && (
-                <div
-                  key={site.key}
-                  className="flex w-full max-w-sm flex-col gap-1.5 px-4"
-                >
-                  <button
-                    type="button"
-                    onClick={backToMediaButtons}
-                    className="self-start text-[11px] text-ink-400 underline underline-offset-2 hover:text-white"
-                  >
-                    ← Back
-                  </button>
-                  {/* These sites hand back a direct, playable video file
-                      URL, so there's nothing to extract or download here —
-                      the "Go" link just opens their own search results in a
-                      new tab, and the person pastes the clip's real URL into
-                      "Paste YouTube URL"'s sibling flow (the generic
-                      paste-a-video-URL box) once they've picked one. */}
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      autoFocus
-                      value={siteQuery}
-                      onChange={(e) => setSiteQuery(e.target.value)}
-                      placeholder="search footage, e.g. “city traffic at night”"
-                      className="w-full rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
-                    />
-                    <a
-                      href={
-                        siteQuery.trim()
-                          ? site.searchUrl(siteQuery.trim())
-                          : undefined
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      aria-disabled={!siteQuery.trim()}
-                      onClick={(e) => {
-                        if (!siteQuery.trim()) {
-                          e.preventDefault();
-                          return;
-                        }
-                        setSiteVisited(true);
-                      }}
-                      className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
-                        siteQuery.trim()
-                          ? "bg-accent-500 text-accent-ink hover:bg-accent-400"
-                          : "cursor-not-allowed bg-ink-700 text-ink-400"
-                      }`}
-                    >
-                      Go ↗
-                    </a>
-                  </div>
-                  <p className="text-[10px] text-ink-500">
-                    Opens {site.label} in a new tab — find a clip there and
-                    use its own Download button to save the file.
-                  </p>
-
-                  {/* Only appears once they've actually clicked Go and been
-                      sent to the site. Pexels and Pixabay don't expose a
-                      copyable direct file link anywhere in their normal UI —
-                      only an HTML page URL, which this app can't play — so
-                      "download it, then upload the file" is the one path
-                      that's actually reliable, rather than a paste-a-link
-                      field that would silently fail for most people. */}
-                  {siteVisited && (
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="rounded-lg border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-[11px] font-medium text-white hover:border-accent-500"
-                    >
-                      Downloaded it? Upload the file →
-                    </button>
-                  )}
-                </div>
-              ),
-          )}
-        </div>
-      )}
-
-      {/* --- Source summary + model picker -------------------------------- */}
-      {meta && model && stage !== "empty" && (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-ink-650 bg-ink-850 px-3 py-2.5 text-[11px] text-ink-400">
-            <span className="truncate text-ink-200">{meta.name}</span>
-            <span>{meta.durationSeconds.toFixed(1)}s</span>
-            <span>
-              {meta.width}×{meta.height}
-            </span>
-            <span>{fmtBytes(meta.sizeBytes)}</span>
+  return (
+    <>
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-white">
+              Select objects &amp; backgrounds
+            </h3>
             <button
               type="button"
-              onClick={() => {
-                setStage("empty");
-                setSourceFile(null);
-                setSourceUrl("");
-                setMeta(null);
-                setClips([]);
-                setIncluded({});
-                backToMediaButtons();
-              }}
-              className="ml-auto text-accent-400 underline underline-offset-2 hover:text-white"
+              onClick={onClose}
+              className="text-[11px] text-ink-400 hover:text-white"
             >
-              Replace video
+              Close
             </button>
           </div>
-
-          <div>
-            <label className="mb-2 block text-[10px] font-medium uppercase tracking-[0.09em] text-accent-400">
-              Model
-            </label>
-            <div className="flex gap-2">
-              {REFERENCE_MODELS.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  onClick={() => setModelId(m.id)}
-                  className={`flex-1 rounded-lg border px-3 py-2.5 text-left text-xs transition ${
-                    m.id === modelId
-                      ? "border-accent-400 bg-accent-500/20 text-white"
-                      : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-600"
-                  }`}
-                >
-                  <span className="block font-medium">{m.label}</span>
-                  <span className="mt-0.5 block text-[10px] text-ink-400">
-                    up to {referenceVideoCapSeconds(m)}s video ·{" "}
-                    {m.maxReferences} images · {resolutionFor(m, m.qualities[0])}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* --- Dynamic capability panel --------------------------------- */}
-          <div className="grid grid-cols-2 gap-2 rounded-lg border border-ink-650 bg-ink-850 p-3 text-[11px] text-ink-300 sm:grid-cols-4">
-            <Cap label="Video reference" value={`up to ${capSeconds}s`} />
-            <Cap label="Image references" value={`${model.maxReferences}`} />
-            <Cap
-              label="Output durations"
-              value={durationsFor(model, "reference2video").join("/") + "s"}
-            />
-            <Cap
-              label="Quality"
-              value={qualitiesFor(model, "reference2video")
-                .map((q) => resolutionFor(model, q))
-                .join(" / ")}
-            />
-            <Cap
-              label="Audio"
-              value={model.supportsAudio ? "Supported" : "Not supported"}
-            />
-            <Cap label="Aspect ratios" value={model.aspectRatios.join(", ")} />
-          </div>
-
-          {/* --- 2. Trim timeline ------------------------------------------ */}
-          <TrimTimeline
-            src={sourceUrl}
-            durationSeconds={meta.durationSeconds}
-            start={range.start}
-            end={range.end}
-            onRangeChange={(start, end) => setRange({ start, end })}
-            capSeconds={capSeconds}
-            canTakeSnap={clips.length > 0}
-            onTakeSnap={handleTakeSnap}
-            snapMarkers={activeClipSnapSeconds}
-            locked={trimLocked}
-          />
-
-          {/* --- Prepare -------------------------------------------------- */}
-          <div className="space-y-2.5">
-            <ConsentCheckbox />
-            <button
-              type="button"
-              onClick={() => void handlePrepare()}
-              disabled={stage === "preparing" || !granted}
-              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
-            >
-              {stage === "preparing"
-                ? `${prepareLabel} ${Math.round(prepareProgress * 100)}%`
-                : "Prepare clip(s)"}
-            </button>
-            <p className="text-center text-[11px] text-ink-400">
-              This finds scene cuts inside your selection, trims each one
-              into its own reference clip, right here in the browser — no
-              file leaves your device until each clip is uploaded. The first
-              clip may take a little longer while the trimming engine itself
-              downloads.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {error && (
-        <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          {error}
-        </p>
-      )}
-
-      {/* --- Snaps ------------------------------------------------------- */}
-      {/* Its own section, separate from the "Clip ready" tiles below — a
-          snap isn't a scene, it's an extra still pulled from whichever clip
-          was prepared most recently (activeClip). Whatever gets edited on
-          one still folds onto that clip's own prompt/image references when
-          saved (saveSnapPrompt), it's just not nested inside that clip's
-          tile visually. */}
-      {activeClip && activeClip.snaps.length > 0 && (
-        <div className="space-y-2 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
-          <h2 className="text-sm font-semibold text-white">📍 Snaps</h2>
-          <p className="text-[11px] text-ink-400">
-            Extra frames grabbed from the trim timeline above. Tap one to
-            select objects on it — whatever you save there is added onto the
-            clip&apos;s own image references below.
+          <p className="text-[11px] leading-relaxed text-ink-400">
+            Tap a suggested object below the frame to add it, or describe
+            anything else — e.g. &quot;the red jacket&quot; or &quot;the
+            background wall&quot; — and press Detect. Each element appears in
+            the list below; tap its{" "}
+            <span className="text-accent-300">✨</span> icon to write what
+            should happen to it and attach reference images, then Save.
           </p>
-          <div className="flex flex-wrap gap-2">
-            {activeClip.snaps.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                onClick={() =>
-                  setSelectorSnap({ clipId: activeClip.job.id, snapId: s.id })
-                }
-                title={
-                  s.elements.some((el) => el.status === "completed")
-                    ? "Snap — selections set, edit →"
-                    : "Snap — select objects →"
-                }
-                className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-ink-650 hover:border-accent-400"
-              >
+
+          {loadingFrame && (
+            <div className="flex h-48 items-center justify-center text-xs text-ink-400">
+              Preparing a frame from this clip…
+            </div>
+          )}
+
+          {frameDataUrl && (
+            <div className="relative mx-auto flex max-h-[65vh] w-fit items-center justify-center overflow-hidden rounded-lg border border-ink-650 bg-black">
+              {/*
+               * Tightly wraps the img (no extra width from the centering
+               * flex parent above) so every absolutely-positioned child here
+               * lines up with the rendered frame pixel-for-pixel, both the
+               * highlight overlays below and the manual-draw pointer math in
+               * fractionFromEvent, which measures this div's own rect.
+               */}
+              <div ref={frameBoxRef} className="relative inline-block">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={s.frameDataUrl}
+                  src={frameDataUrl}
                   alt=""
-                  className="h-full w-full object-cover"
+                  draggable={false}
+                  className="block max-h-[65vh] w-auto max-w-full select-none object-contain"
                 />
-                {s.elements.some((el) => el.status === "completed") && (
-                  <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
+                {/*
+                 * Every element stays highlighted on the frame, not just the
+                 * one currently being detected — the closest a text-concept
+                 * model (or a hand-drawn box) gets to a true hover/long-press
+                 * highlight. Tinted with mask-image/background-color rather
+                 * than mix-blend-screen so several elements read as distinct
+                 * colors instead of stacking into one white blob.
+                 */}
+                {elements.map((el) => (
+                  <div
+                    key={el.elementId}
+                    className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
+                    style={{
+                      backgroundColor: el.color,
+                      WebkitMaskImage: `url(${el.maskUrl})`,
+                      maskImage: `url(${el.maskUrl})`,
+                      WebkitMaskSize: "contain",
+                      maskSize: "contain",
+                      WebkitMaskRepeat: "no-repeat",
+                      maskRepeat: "no-repeat",
+                      WebkitMaskPosition: "center",
+                      maskPosition: "center",
+                    }}
+                  />
+                ))}
+                {pending && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={pending.maskUrl}
+                    alt=""
+                    className="pointer-events-none absolute inset-0 h-full w-full animate-pulse object-contain opacity-70 mix-blend-screen"
+                  />
                 )}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* --- Detected scenes + transfer -------------------------------------- */}
-      {(stage === "ready" || (stage === "preparing" && clips.length > 0)) &&
-        clips.length > 0 && (
-          <div className="space-y-3 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold text-white">
-                {clips.length === 1
-                  ? "Clip ready"
-                  : `${clips.length} scene${clips.length === 1 ? "" : "s"} found — ${selectedJobs.length} selected`}
-              </h2>
-              {clips.length > 1 && (
-                <div className="flex shrink-0 gap-2 text-[11px]">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIncluded(
-                        Object.fromEntries(clips.map((c) => [c.job.id, true])),
-                      )
-                    }
-                    className="text-accent-400 underline underline-offset-2 hover:text-white"
+                {/* The manual selection being built, across however many
+                    add/subtract strokes so far — shown between strokes (the
+                    in-progress single stroke itself has its own live preview
+                    further below) so it's clear what the next stroke will
+                    add to or carve out of. */}
+                {pendingMaskUrl && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={pendingMaskUrl}
+                    alt=""
+                    className="pointer-events-none absolute inset-0 h-full w-full object-contain opacity-70 mix-blend-screen"
+                  />
+                )}
+                {segmenting && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-xs text-white">
+                    Detecting…
+                  </div>
+                )}
+                {/*
+                 * Manual draw surface — only intercepts pointer events while
+                 * manualMode is on, so it doesn't swallow clicks the rest of
+                 * the time. Pointer Events (not mouse/touch separately)
+                 * cover both a mouse drag and a finger drag on mobile in one
+                 * path.
+                 */}
+                {manualMode && (
+                  <div
+                    className="absolute inset-0 cursor-crosshair touch-none"
+                    onPointerDown={startManualDraw}
+                    onPointerMove={moveManualDraw}
+                    onPointerUp={endManualDraw}
+                    onPointerCancel={endManualDraw}
                   >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIncluded(
-                        Object.fromEntries(clips.map((c) => [c.job.id, false])),
-                      )
-                    }
-                    className="text-accent-400 underline underline-offset-2 hover:text-white"
-                  >
-                    None
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-              {clips.map((c, i) => {
-                const isIncluded = included[c.job.id] !== false;
-                return (
-                  <label
-                    key={c.job.id}
-                    className={`relative block cursor-pointer overflow-hidden rounded-lg border transition ${
-                      isIncluded
-                        ? "border-accent-400"
-                        : "border-ink-650 opacity-50"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={isIncluded}
-                      onChange={(e) =>
-                        setIncluded((prev) => ({
-                          ...prev,
-                          [c.job.id]: e.target.checked,
-                        }))
-                      }
-                      className="absolute right-1.5 top-1.5 z-10 h-4 w-4 accent-accent-500"
-                    />
-                    {c.thumbnail ? (
-                      // A fixed-height, letterboxed frame rather than a
-                      // forced 16:9 crop — these reference clips are just as
-                      // often 9:16, and cropping or stretching a portrait
-                      // thumbnail into a landscape box is what made this
-                      // tile look warped before. object-contain keeps the
-                      // actual frame undistorted; the dark bars fill
-                      // whatever's left in the box.
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={c.thumbnail}
-                        alt=""
-                        className="flex h-32 w-full items-center justify-center bg-ink-900 object-contain"
-                      />
-                    ) : (
-                      <div className="flex h-32 w-full items-center justify-center bg-ink-900 text-[10px] text-ink-500">
-                        No preview
-                      </div>
-                    )}
-                    <div className="flex items-center justify-between bg-ink-850 px-2 py-1 text-[10px] text-ink-300">
-                      <span>
-                        Scene {i + 1} ·{" "}
-                        {c.job.referenceVideoDurationSeconds.toFixed(1)}s
-                      </span>
-                      <a
-                        href={c.job.referenceVideoUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="text-accent-400 underline underline-offset-2 hover:text-white"
+                    {drawShape === "box" &&
+                      dragRect &&
+                      (() => {
+                        const r = normalizeRect(dragRect);
+                        return (
+                          <div
+                            className="pointer-events-none absolute border-2 border-dashed border-accent-400 bg-accent-400/15"
+                            style={{
+                              left: `${r.left * 100}%`,
+                              top: `${r.top * 100}%`,
+                              width: `${(r.right - r.left) * 100}%`,
+                              height: `${(r.bottom - r.top) * 100}%`,
+                            }}
+                          />
+                        );
+                      })()}
+                    {drawShape === "pencil" && freehandPoints && (
+                      // viewBox 0 0 1 1 matches the fraction coordinates
+                      // points are stored in directly — no extra scaling
+                      // math. vector-effect keeps the stroke a constant
+                      // screen width even though the viewBox is stretched to
+                      // a non-square box for a portrait/landscape frame.
+                      <svg
+                        className="pointer-events-none absolute inset-0 h-full w-full"
+                        viewBox="0 0 1 1"
+                        preserveAspectRatio="none"
                       >
-                        ↗
-                      </a>
-                    </div>
+                        <polygon
+                          points={freehandPoints
+                            .map((p) => `${p.x},${p.y}`)
+                            .join(" ")}
+                          fill="rgba(163,230,53,0.2)"
+                          stroke="#a3e635"
+                          strokeWidth={2}
+                          vectorEffect="non-scaling-stroke"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {frameUrl && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setManualMode((m) => !m);
+                  setDragRect(null);
+                  setFreehandPoints(null);
+                  resetManualSelection();
+                }}
+                className={`rounded-md border px-2.5 py-1 text-[11px] font-medium transition ${
+                  manualMode
+                    ? "border-accent-500 bg-accent-500/15 text-accent-300"
+                    : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
+                }`}
+              >
+                {manualMode
+                  ? "✓ Drawing — tap again to stop"
+                  : "✎ Draw a selection manually"}
+              </button>
+              {manualMode && (
+                <>
+                  <div className="flex overflow-hidden rounded-md border border-ink-650">
                     <button
                       type="button"
-                      onClick={(e) => {
-                        // Opening the selector isn't about this checkbox —
-                        // without this, the click would also toggle include
-                        // state, since the whole tile is a <label>.
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSelectorClipId(c.job.id);
+                      onClick={() => {
+                        setDrawShape("box");
+                        setFreehandPoints(null);
                       }}
-                      className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-center text-[10px] text-accent-400 hover:bg-ink-850 hover:text-white"
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        drawShape === "box"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
                     >
-                      {c.job.prompt
-                        ? "Selections set — edit →"
-                        : "Select objects →"}
+                      ▭ Box
                     </button>
-                  </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDrawShape("pencil");
+                        setDragRect(null);
+                      }}
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        drawShape === "pencil"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ✎ Pencil
+                    </button>
+                  </div>
+                  {/* Which way each new box/pencil stroke combines into the
+                      selection being built — see commitManualStroke's doc
+                      comment. Only meaningful once there's already something
+                      to add to or subtract from, but left always visible
+                      (rather than only after the first stroke) so it reads
+                      as "how the next stroke will behave" from the start,
+                      not a control that appears out of nowhere mid-draw. */}
+                  <div className="flex overflow-hidden rounded-md border border-ink-650">
+                    <button
+                      type="button"
+                      onClick={() => setManualCombineMode("add")}
+                      title="Add to selection"
+                      aria-label="Add to selection"
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        manualCombineMode === "add"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ⊕ Add
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setManualCombineMode("subtract")}
+                      title="Subtract from selection"
+                      aria-label="Subtract from selection"
+                      className={`px-2.5 py-1 text-[11px] font-medium transition ${
+                        manualCombineMode === "subtract"
+                          ? "bg-accent-500 text-accent-ink"
+                          : "bg-ink-850 text-ink-300 hover:text-white"
+                      }`}
+                    >
+                      ⊖ Subtract
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {pendingMaskUrl && (
+            <div className="flex items-center gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
+              <input
+                type="text"
+                autoFocus
+                value={manualName}
+                onChange={(e) => setManualName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") confirmManualSelection();
+                  if (e.key === "Escape") {
+                    resetManualSelection();
+                    setManualName("");
+                  }
+                }}
+                placeholder="Name this selection, e.g. “the grapefruit” — or keep drawing to add/subtract more first"
+                className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+              />
+              <button
+                type="button"
+                onClick={confirmManualSelection}
+                disabled={!manualName.trim()}
+                className="shrink-0 rounded-md bg-accent-500 px-3 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+              >
+                Add
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  resetManualSelection();
+                  setManualName("");
+                }}
+                className="shrink-0 text-xs text-ink-400 hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {frameUrl && (loadingCandidates || candidates.length > 0) && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {loadingCandidates && candidates.length === 0 && (
+                <span className="text-[11px] text-ink-500">
+                  Finding objects…
+                </span>
+              )}
+              {candidates.map((label) => {
+                const el = elementForLabel(label);
+                const busy = pillBusy === label;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => void addByLabel(label)}
+                    disabled={busy}
+                    className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition disabled:cursor-wait disabled:opacity-60 ${
+                      el
+                        ? "border-transparent text-white"
+                        : "border-ink-650 bg-ink-850 text-ink-200 hover:border-ink-500"
+                    }`}
+                    style={
+                      el ? { backgroundColor: `${el.color}33` } : undefined
+                    }
+                  >
+                    {el && (
+                      <span
+                        className="h-1.5 w-1.5 rounded-full"
+                        style={{ backgroundColor: el.color }}
+                        aria-hidden
+                      />
+                    )}
+                    {busy ? "Detecting…" : label}
+                  </button>
                 );
               })}
             </div>
+          )}
 
-            <button
-              type="button"
-              onClick={() => void continueInStudio()}
-              disabled={
-                stage !== "ready" ||
-                selectedJobs.length === 0 ||
-                navigatingToStudio
-              }
-              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
-            >
-              {navigatingToStudio ? "Opening Studio…" : "Continue in Mic Studio →"}
-            </button>
-            <p className="text-center text-[11px] text-ink-400">
-              Opens Studio with {model?.label} and{" "}
-              {selectedJobs.length === 1
-                ? "the selected clip"
-                : "the first selected clip"}{" "}
-              already loaded into Reference mode. Nothing generates and no
-              credit is spent until you review it there and press Generate
-              yourself.
+          {!pending && (
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={describeText}
+                onChange={(e) => setDescribeText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void handleDetect();
+                }}
+                placeholder="What do you want to select? e.g. “the dog”"
+                disabled={!frameUrl || segmenting}
+                className="flex-1 rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500 disabled:opacity-50"
+              />
+              <button
+                type="button"
+                onClick={() => void handleDetect()}
+                disabled={!frameUrl || !describeText.trim() || segmenting}
+                className="shrink-0 rounded-md bg-accent-500 px-3 py-1.5 text-xs font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+              >
+                Detect
+              </button>
+            </div>
+          )}
+
+          {pending && (
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-accent-500/30 bg-accent-500/[0.08] px-3 py-2">
+              <span className="text-xs text-ink-200">
+                Found <span className="text-white">“{pending.name}”</span> —
+                keep it?
+              </span>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  onClick={keepPending}
+                  className="rounded-md bg-accent-500 px-2.5 py-1 text-xs font-semibold text-accent-ink hover:bg-accent-400"
+                >
+                  Keep
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPending(null)}
+                  className="text-xs text-ink-400 hover:text-white"
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              {error}
             </p>
+          )}
+
+          {elements.length > 0 && (
+            <ul className="space-y-1.5">
+              {elements.map((el) => (
+                <li
+                  key={el.elementId}
+                  className="flex items-center justify-between gap-2 rounded-lg border border-ink-650 bg-ink-850 px-3 py-1.5 text-xs text-ink-200"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: el.color }}
+                      aria-hidden
+                    />
+                    <span
+                      className={
+                        el.status === "completed"
+                          ? "shrink-0 text-accent-400"
+                          : "shrink-0 text-ink-500"
+                      }
+                      aria-hidden
+                    >
+                      {el.status === "completed" ? "✓" : "○"}
+                    </span>
+                    <span className="truncate">{el.label}</span>
+                  </span>
+                  <span className="flex shrink-0 items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => openEditor(el)}
+                      className="text-ink-400 hover:text-white"
+                      title="Write an edit instruction"
+                      aria-label={`Edit instruction for ${el.label}`}
+                    >
+                      ✨
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeElement(el.elementId)}
+                      className="text-ink-400 hover:text-white"
+                      aria-label={`Remove ${el.label}`}
+                    >
+                      ✕
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <button
+            type="button"
+            onClick={handleDone}
+            className="w-full rounded-xl bg-accent-500 px-4 py-2.5 text-sm font-semibold text-accent-ink hover:bg-accent-400"
+          >
+            {elements.length > 0
+              ? `Done — ${completedCount}/${elements.length} ready`
+              : "Done"}
+          </button>
+        </div>
+      </div>
+
+      {editingElement &&
+        (() => {
+          const hasContent =
+            draftMessages.length > 0 || composeText.trim().length > 0;
+          return (
+            <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4">
+              <div className="flex max-h-[90vh] w-full max-w-md flex-col gap-3 overflow-y-auto rounded-xl border border-ink-650 bg-ink-900 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <input
+                    type="text"
+                    value={draftLabel}
+                    onChange={(e) => setDraftLabel(e.target.value)}
+                    placeholder="Label"
+                    aria-label="Element label"
+                    className="min-w-0 flex-1 truncate rounded-md border border-transparent bg-transparent px-1 py-1 text-sm font-semibold text-white outline-none focus:border-ink-650 focus:bg-ink-850"
+                  />
+                  <div className="flex shrink-0 items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void regenerateSelection()}
+                      disabled={regenerating}
+                      title="Regenerate this selection"
+                      aria-label="Regenerate this selection"
+                      className="text-ink-400 hover:text-white disabled:cursor-wait disabled:opacity-50"
+                    >
+                      {regenerating ? "…" : "↻"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={removeEditingElement}
+                      title="Remove this element"
+                      aria-label="Remove this element"
+                      className="text-ink-400 hover:text-red-400"
+                    >
+                      🗑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={closeEditor}
+                      className="text-[11px] text-ink-400 hover:text-white"
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+
+                {/*
+                 * A running chat about this one element: it opens with the
+                 * highlighted crop already "attached" as the first bubble
+                 * (exactly what's selected, shown the way it'd look pinned
+                 * in a ChatGPT-style thread), then every instruction typed
+                 * — past and new — appears below it as its own message.
+                 * There's no reply bubble because nothing here calls a
+                 * model yet (see lib/promptCombiner.ts); regenerating or
+                 * saving both read straight out of this same thread.
+                 */}
+                <div className="flex max-h-[42vh] flex-col gap-2 overflow-y-auto rounded-lg border border-ink-650 bg-black/40 p-2.5">
+                  {frameDataUrl && (
+                    <div className="flex justify-end">
+                      <div className="max-w-[85%] overflow-hidden rounded-xl rounded-tr-sm border border-ink-650 bg-ink-850">
+                        <div className="relative flex max-h-56 items-center justify-center bg-black">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={frameDataUrl}
+                            alt=""
+                            className="block max-h-56 w-auto max-w-full object-contain"
+                          />
+                          <div
+                            className="pointer-events-none absolute inset-0 h-full w-full opacity-70"
+                            style={{
+                              backgroundColor: editingElement.color,
+                              WebkitMaskImage: `url(${editingElement.maskUrl})`,
+                              maskImage: `url(${editingElement.maskUrl})`,
+                              WebkitMaskSize: "contain",
+                              maskSize: "contain",
+                              WebkitMaskRepeat: "no-repeat",
+                              maskRepeat: "no-repeat",
+                              WebkitMaskPosition: "center",
+                              maskPosition: "center",
+                            }}
+                          />
+                        </div>
+                        <p className="px-2.5 py-1.5 text-[10px] text-ink-400">
+                          Attached — the highlighted selection
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {draftMessages.map((m) => {
+                    if (m.role === "user") {
+                      return (
+                        <div key={m.id} className="flex justify-end">
+                          <div className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-tr-sm bg-accent-500/15 px-3 py-2 text-xs text-white">
+                            {m.text}
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (m.role === "note") {
+                      return (
+                        <p
+                          key={m.id}
+                          className="text-center text-[10px] text-ink-500"
+                        >
+                          {m.text}
+                        </p>
+                      );
+                    }
+                    // role === "result" — the actual edited frame, shown
+                    // left-aligned like a reply, the way the thread tells
+                    // apart "what I asked for" from "what came back".
+                    return (
+                      <div key={m.id} className="flex justify-start">
+                        <div className="max-w-[85%] overflow-hidden rounded-xl rounded-tl-sm border border-ink-650 bg-ink-850">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={m.imageUrl}
+                            alt=""
+                            className="block max-h-56 w-auto max-w-full object-contain"
+                          />
+                          <p className="px-2.5 py-1.5 text-[10px] text-ink-400">
+                            {m.mock
+                              ? "Mock result — no real edit applied"
+                              : "Generated"}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {generating && (
+                    <div className="flex justify-start">
+                      <div className="rounded-xl rounded-tl-sm border border-ink-650 bg-ink-850 px-3 py-2 text-xs text-ink-400">
+                        Generating…
+                      </div>
+                    </div>
+                  )}
+
+                  {draftAttachments.length > 0 && (
+                    <div className="flex justify-end">
+                      <ul className="flex max-w-[85%] flex-wrap justify-end gap-2">
+                        {draftAttachments.map((a) => (
+                          <li
+                            key={a.attachmentId}
+                            className="relative h-14 w-14 overflow-hidden rounded-md border border-ink-650 bg-ink-850"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={a.thumbnail}
+                              alt=""
+                              className="h-full w-full object-cover"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                removeDraftAttachment(a.attachmentId)
+                              }
+                              className="absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/70 text-[10px] text-white hover:bg-black"
+                              aria-label="Remove attachment"
+                            >
+                              ✕
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-end gap-2">
+                  <textarea
+                    value={composeText}
+                    onChange={(e) => setComposeText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        sendComposedMessage();
+                      }
+                    }}
+                    rows={2}
+                    placeholder='e.g. "Replace this with a different version — keep the same scale, lighting, and shadow direction as the rest of the scene."'
+                    className="flex-1 resize-y rounded-md border border-ink-650 bg-ink-900 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+                  />
+                  <div className="flex shrink-0 flex-col gap-1.5">
+                    <label
+                      className="cursor-pointer rounded-md border border-ink-650 bg-ink-850 px-2.5 py-1.5 text-center text-[11px] text-ink-200 hover:border-ink-500"
+                      title="Attach reference images"
+                    >
+                      {attachmentUploading ? "…" : "📎"}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        className="hidden"
+                        disabled={attachmentUploading}
+                        onChange={(e) => {
+                          void handleAttachmentFiles(e.target.files);
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => void sendComposedMessage()}
+                      disabled={!composeText.trim() || generating}
+                      className="rounded-md bg-accent-500 px-2.5 py-1.5 text-[11px] font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+                    >
+                      {generating ? "…" : "Send"}
+                    </button>
+                  </div>
+                </div>
+                <p className="-mt-1.5 text-[10px] text-ink-500">
+                  Enter to send, Shift+Enter for a new line. Send actually
+                  generates this element&apos;s edited frame — everything
+                  outside the highlight stays untouched, and the result
+                  (labeled Mock if mock mode is on) becomes what reaches Mic
+                  Studio for this element. ↻ instead moves the highlighted
+                  area itself, without generating anything. 📎 attaches extra
+                  reference images, described in your own words for now
+                  rather than sent to the model directly.
+                </p>
+
+                {editorError && (
+                  <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                    {editorError}
+                  </p>
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={closeEditor}
+                    className="flex-1 rounded-xl border border-ink-650 px-4 py-2.5 text-sm font-medium text-ink-300 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveEditor}
+                    disabled={!hasContent}
+                    className="flex-1 rounded-xl bg-accent-500 px-4 py-2.5 text-sm font-semibold text-accent-ink hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400"
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+      {showIncompleteWarning && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-sm rounded-xl border border-ink-650 bg-ink-900 p-4">
+            <p className="text-sm text-white">
+              {incompleteCount === 1
+                ? "1 selected element has no editing instruction."
+                : `${incompleteCount} selected elements have no editing instruction.`}
+            </p>
+            <p className="mt-1 text-xs text-ink-400">
+              Continue without it, or go back and add one?
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={() => setShowIncompleteWarning(false)}
+                className="flex-1 rounded-xl border border-ink-650 px-4 py-2.5 text-sm font-medium text-ink-300 hover:text-white"
+              >
+                Go back
+              </button>
+              <button
+                type="button"
+                onClick={continueWithoutIncomplete}
+                className="flex-1 rounded-xl bg-accent-500 px-4 py-2.5 text-sm font-semibold text-accent-ink hover:bg-accent-400"
+              >
+                Continue without it
+              </button>
+            </div>
           </div>
-        )}
-
-      {/* --- Coming next ----------------------------------------------- */}
-      <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
-        <span className="font-medium text-ink-200">Coming next:</span>{" "}
-        real ChatGPT-based prompt optimization per element — each
-        element&apos;s instruction is used exactly as typed for now, combined
-        into one prompt once you press Done, which you can still edit further
-        once you land in Mic Studio.
-      </div>
-
-      {selectorClip && meta && (
-        <SceneObjectSelector
-          sourceUrl={sourceUrl}
-          sourceWidth={meta.width}
-          sourceHeight={meta.height}
-          clipStart={selectorClip.start}
-          clipEnd={selectorClip.end}
-          elements={selectorClip.elements}
-          onElementsChange={(updater) =>
-            setClipElements(selectorClip.job.id, updater)
-          }
-          granted={granted}
-          onClose={() => setSelectorClipId(null)}
-          onSave={(result) => savePromptForClip(selectorClip.job.id, result)}
-        />
+        </div>
       )}
-
-      {selectorSnapRecord && selectorSnapClip && (
-        <SceneObjectSelector
-          sourceUrl={sourceUrl}
-          sourceWidth={selectorSnapRecord.frameWidth}
-          sourceHeight={selectorSnapRecord.frameHeight}
-          clipStart={selectorSnapClip.start}
-          clipEnd={selectorSnapClip.end}
-          presetFrameDataUrl={selectorSnapRecord.frameDataUrl}
-          elements={selectorSnapRecord.elements}
-          onElementsChange={(updater) =>
-            setSnapElements(
-              selectorSnapClip.job.id,
-              selectorSnapRecord.id,
-              updater,
-            )
-          }
-          granted={granted}
-          onClose={() => setSelectorSnap(null)}
-          onSave={(result) =>
-            saveSnapPrompt(
-              selectorSnapClip.job.id,
-              selectorSnapRecord.id,
-              result,
-            )
-          }
-        />
-      )}
-    </div>
-  );
-}
-
-function Cap({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="text-[9px] uppercase tracking-wide text-ink-500">
-        {label}
-      </div>
-      <div className="mt-0.5 text-ink-100">{value}</div>
-    </div>
+    </>
   );
 }
