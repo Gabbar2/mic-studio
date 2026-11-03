@@ -114,6 +114,28 @@ export async function POST(req: Request) {
   const isAnonymous = user.is_anonymous === true;
   const unlocked = !isAnonymous && (await isUnlockedAccount(user.id));
 
+  // Fetched early (rather than down at the burst guard, where this used to
+  // live) because isAdmin also has to gate the free-tier shape check and the
+  // credit debit further down, both of which run before the old fetch site.
+  // One combined query — daily_quota and is_admin both live on the same
+  // profiles row — instead of two round trips.
+  const admin = createAdminClient();
+  const { data: profile } = await admin
+    .from("profiles")
+    .select("daily_quota, is_admin")
+    .eq("id", user.id)
+    .maybeSingle();
+
+  // Admins test every model/quality/duration combo on the real app, not a
+  // staging copy, so they can't be stuck behind the free tier's shape caps
+  // or the credit ledger the way a real customer is. This does NOT exempt
+  // them from the daily burst-quota check below (still a real cap, same as
+  // everyone else) or from the fal-balance-availability check (a genuine
+  // provider outage isn't something admin status can wave away) — only from
+  // tier shape restrictions and from actually paying. See the debit site
+  // further down for the other half of this.
+  const isAdmin = profile?.is_admin === true;
+
   await ensureSignupGrant(
     user.id,
     isAnonymous,
@@ -179,7 +201,7 @@ export async function POST(req: Request) {
         { status: 403 },
       );
     }
-  } else if (!unlocked) {
+  } else if (!unlocked && !isAdmin) {
     const availableCents = await creditBalance(user.id);
     const violation = checkFreeTierShape(
       {
@@ -243,18 +265,14 @@ export async function POST(req: Request) {
     }
   }
 
-  const admin = createAdminClient();
   const provider = activeProvider();
 
   // --- burst guard ---------------------------------------------------------
   // Credits are the budget; this only stops a runaway loop from emptying a
-  // funded account in seconds.
-  const { data: profile } = await admin
-    .from("profiles")
-    .select("daily_quota")
-    .eq("id", user.id)
-    .maybeSingle();
-
+  // funded account in seconds. Applies to admin accounts too (see isAdmin
+  // above) — the one spending cap that still holds even when testing is
+  // otherwise free, so a stuck loop can't quietly drain the whole fal
+  // balance just because it's running under an admin login.
   const quota = profile?.daily_quota ?? 20;
   const { data: usedToday } = await admin.rpc("generations_today", {
     p_user: user.id,
@@ -350,7 +368,14 @@ export async function POST(req: Request) {
   // --- take payment before calling the provider ---------------------------
   // The row exists first so the charge has something to reference, and so a
   // refusal leaves no phantom job behind.
-  const paid = await tryDebit(user.id, chargedCents, gen.id);
+  //
+  // Admin accounts skip the debit entirely rather than being charged and
+  // refunded — there is no credit-ledger entry to reverse, so nothing here
+  // ever nets to a confusing "charged $X, refunded $X" pair of rows for an
+  // account that was never supposed to be billed in the first place. This is
+  // real fal spend, though — see the isAdmin comment above; the burst-quota
+  // guard a few lines up is the only thing still capping it.
+  const paid = isAdmin || (await tryDebit(user.id, chargedCents, gen.id));
 
   if (!paid) {
     await admin.from("generations").delete().eq("id", gen.id);
@@ -402,7 +427,11 @@ export async function POST(req: Request) {
     console.error("[generate] provider error", e);
 
     // The provider does not bill for a failed submission, so neither do we.
-    await refundGeneration(user.id, gen.id, chargedCents, message);
+    // Skipped for admin: there was no debit above to reverse, so a refund
+    // here would mint chargedCents of real credit out of nowhere.
+    if (!isAdmin) {
+      await refundGeneration(user.id, gen.id, chargedCents, message);
+    }
 
     await admin
       .from("generations")
