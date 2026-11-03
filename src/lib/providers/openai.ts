@@ -60,9 +60,11 @@ async function fetchBytes(url: string): Promise<Buffer> {
  * pixel marks "regenerate this", an opaque one marks "keep this exactly as
  * it is". This app's masks mean the opposite (opaque = the selected
  * element) because that's what the CSS `mask-image` highlight technique
- * needs. Also force-resizes to the frame's own pixel dimensions — OpenAI
- * requires the mask and the image to match exactly, and nothing upstream
- * (a fal-returned mask, a hand-drawn one) guarantees that already.
+ * needs. `width`/`height` here are the TARGET canvas — the same one the
+ * image gets fitted to in `fitToSize` below — not the mask's own native
+ * size, and the resize uses the same "cover"/centered crop as that
+ * function so the two stay pixel-aligned (see the comment on
+ * editElementImage for why that match matters).
  */
 async function buildOpenAiMask(
   maskBytes: Buffer,
@@ -70,7 +72,7 @@ async function buildOpenAiMask(
   height: number,
 ): Promise<Buffer> {
   const { data, info } = await sharp(maskBytes)
-    .resize(width, height, { fit: "fill" })
+    .resize(width, height, { fit: "cover", position: "center" })
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
@@ -100,6 +102,41 @@ function pickSize(
   return "1024x1024";
 }
 
+function parseSize(size: string): { width: number; height: number } {
+  const [width, height] = size.split("x").map(Number);
+  return { width, height };
+}
+
+/**
+ * Crops+scales ("cover", centered) the frame to exactly the canvas named in
+ * `size` above, instead of uploading the frame at its own native
+ * resolution. Fixes a real misalignment bug: `size` was being sent to
+ * OpenAI as one of only three fixed buckets (close to the frame's aspect
+ * ratio, but rarely exact — e.g. a 9:16 capture bucketed into 1024x1536,
+ * which is 2:3), while the `image` and `mask` files were uploaded at the
+ * frame's own, different-aspect native resolution. OpenAI has to make the
+ * image it actually edits match the `size` canvas somehow, and whatever it
+ * did internally to reconcile that (crop, pad, or stretch) wasn't
+ * reflected in our mask, which was still aligned to the original,
+ * uncropped frame — so the edit (and any new content the model added
+ * while reconciling the mismatch) could land anywhere relative to the
+ * highlighted selection. Resizing the image ourselves to the exact
+ * declared canvas, with the mask forced through the identical transform in
+ * buildOpenAiMask, removes that ambiguity: image, mask, and the `size` we
+ * claim are now all the same canvas, so there's nothing left for OpenAI to
+ * silently reconcile.
+ */
+async function fitToSize(
+  bytes: Buffer,
+  width: number,
+  height: number,
+): Promise<Buffer> {
+  return sharp(bytes)
+    .resize(width, height, { fit: "cover", position: "center" })
+    .png()
+    .toBuffer();
+}
+
 export async function editElementImage({
   imageUrl,
   maskUrl,
@@ -121,17 +158,25 @@ export async function editElementImage({
   // as JPEG — see videoThumbnail.ts) — the edits endpoint's image+mask flow
   // is documented and tested against PNG; converting here removes any
   // doubt rather than hoping a JPEG input is accepted too.
-  const pngImage = await sharp(imageBytes).png().toBuffer();
-  const meta = await sharp(pngImage).metadata();
-  const width = meta.width ?? 1024;
-  const height = meta.height ?? 1024;
+  const pngImageNative = await sharp(imageBytes).png().toBuffer();
+  const meta = await sharp(pngImageNative).metadata();
+  const nativeWidth = meta.width ?? 1024;
+  const nativeHeight = meta.height ?? 1024;
 
+  const size = pickSize(nativeWidth, nativeHeight);
+  const { width, height } = parseSize(size);
+
+  // Both fitted to the exact same target canvas (see fitToSize's doc
+  // comment) — this is what keeps the mask lined up with what actually
+  // gets edited, instead of the frame going out at its own native
+  // resolution while `size` below claims a different one.
+  const pngImage = await fitToSize(pngImageNative, width, height);
   const openAiMask = await buildOpenAiMask(maskBytes, width, height);
 
   const form = new FormData();
   form.append("model", MODEL);
   form.append("prompt", prompt);
-  form.append("size", pickSize(width, height));
+  form.append("size", size);
   form.append(
     "image",
     new Blob([new Uint8Array(pngImage)], { type: "image/png" }),
