@@ -158,7 +158,13 @@ export default function Composer({
   // steeper markup than Kling since its provider cost is so much lower) is
   // priced on that curve instead of the operator's blanket `priceMarkup`.
   const price = roundChargeCents(cost * effectiveMarkup(model, priceMarkup));
-  const affordable = !billingEnabled || creditCents >= price;
+  // Admins never get stopped by their own balance here — the server already
+  // skips the debit for them (see isAdmin in /api/generate), so a client-side
+  // "Not enough credit" disable would just be lying about why the button
+  // doesn't work. The admin-only price/cost/margin line below this still
+  // shows what it WOULD have cost a real customer, which is the number that
+  // matters for them.
+  const affordable = isAdmin || !billingEnabled || creditCents >= price;
 
   /**
    * What a specific (quality, duration[, mode]) combination would actually
@@ -188,7 +194,8 @@ export default function Composer({
    * back to the old FREE_QUALITY/FREE_DURATIONS/FREE_MODES-only behavior in
    * that case, same as this component did before the balance-aware gating.
    */
-  const canAfford = (cents: number) => billingEnabled && creditCents! >= cents;
+  const canAfford = (cents: number) =>
+    isAdmin || (billingEnabled && creditCents! >= cents);
 
   /**
    * A free-tier account with enough bought/bonus credit to cover a mode's
@@ -213,7 +220,7 @@ export default function Composer({
    * with it.
    */
   const shortfallHint = (costCents: number): string | undefined => {
-    if (!billingEnabled) return undefined;
+    if (isAdmin || !billingEnabled) return undefined;
     const short = Math.max(0, costCents - creditCents!);
     return short > 0 ? `+${creditLabel(short)} short` : undefined;
   };
