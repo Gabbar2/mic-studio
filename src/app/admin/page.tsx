@@ -4,6 +4,12 @@ import UsersTable from "@/components/admin/UsersTable";
 import RetentionCleanupPanel from "@/components/admin/RetentionCleanupPanel";
 import ElementEditSettingsPanel from "@/components/admin/ElementEditSettingsPanel";
 import UsersExportButton from "@/components/admin/UsersExportButton";
+import BalanceAlertBanner from "@/components/admin/BalanceAlertBanner";
+import {
+  creditLiabilityCents,
+  liabilityAsProviderCents,
+  providerBalanceCentsFresh,
+} from "@/lib/appState";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +29,7 @@ export const dynamic = "force-dynamic";
 export default async function AdminUsersPage() {
   const { admin } = await requireAdmin();
 
-  const [{ data: profiles }, { data: overview }, authUsers] =
+  const [{ data: profiles }, { data: overview }, authUsers, balanceCents, liabilityCents] =
     await Promise.all([
       admin
         .from("profiles")
@@ -34,7 +40,17 @@ export default async function AdminUsersPage() {
       // tool, not a customer-facing list, and pagination can be added the
       // day that limit actually bites.
       admin.auth.admin.listUsers({ perPage: 200 }),
+      // Same figures StudioHeader's admin-only tooltip already shows, fetched
+      // again here so the warning is the first thing an admin sees on this
+      // page, not something they have to notice a small balance figure to go
+      // looking for — see BalanceAlertBanner's own doc comment.
+      providerBalanceCentsFresh(),
+      creditLiabilityCents(),
     ]);
+  const coverageCents = liabilityAsProviderCents(
+    liabilityCents,
+    Number(process.env.PRICE_MARKUP ?? 1.8),
+  );
 
   const authById = new Map(
     (authUsers.data?.users ?? []).map((u) => [u.id, u]),
@@ -85,7 +101,14 @@ export default async function AdminUsersPage() {
           </a>
         </div>
 
-        <div className="mt-4 flex items-baseline justify-between gap-4">
+        <div className="mt-4">
+          <BalanceAlertBanner
+            balanceCents={balanceCents}
+            coverageCents={coverageCents}
+          />
+        </div>
+
+        <div className="flex items-baseline justify-between gap-4">
           <h1 className="text-2xl font-semibold tracking-tight text-white">
             Users
           </h1>
