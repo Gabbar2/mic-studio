@@ -766,7 +766,25 @@ export const falProvider: VideoProvider = {
     const mapped = mapStatus(statusRes.json.status);
 
     if (mapped === "failed") {
-      return { taskId, status: "failed", error: errorText(statusRes.json) };
+      // The status endpoint's own `error` is often just a short summary —
+      // "Unexpected status code: 422" with nothing saying which field or
+      // which reference asset caused it. fal puts the real exception payload
+      // (the same field-level `detail` array errorText() knows how to read)
+      // on the request's own result endpoint instead, even for a failed job,
+      // so this fetches that too and prefers it whenever it has more to say
+      // than the status endpoint did — a longer message here reliably means
+      // a more specific one, since the generic fallback text is always short.
+      const statusError = errorText(statusRes.json);
+      const resultRes = await falFetch<FalResult>(
+        `${app}/requests/${taskId}`,
+        { method: "GET" },
+      ).catch(() => null);
+      const resultError = resultRes ? errorText(resultRes.json) : null;
+      const error =
+        resultError && resultError.length > statusError.length
+          ? resultError
+          : statusError;
+      return { taskId, status: "failed", error };
     }
     if (mapped !== "succeeded") {
       return { taskId, status: mapped };
