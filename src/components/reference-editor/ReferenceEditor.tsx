@@ -10,7 +10,7 @@ import ConsentCheckbox, {
 import { uploadMedia } from "@/lib/upload";
 import { extractClip, planScenesFromCuts } from "@/lib/videoClip";
 import { detectSceneCuts } from "@/lib/sceneDetect";
-import { captureThumbnail } from "@/lib/videoThumbnail";
+import { captureThumbnail, captureThumbnails } from "@/lib/videoThumbnail";
 import { loadFfmpeg } from "@/lib/ffmpegLoader";
 import {
   writeReferenceTransfer,
@@ -124,6 +124,13 @@ interface PreparedClip {
   /** Extra frames grabbed via "Take Snap" while this clip was the most
    * recently prepared one — see SnapRecord above. */
   snaps: SnapRecord[];
+  /**
+   * What this clip's own beat should say on screen — typed by hand, never
+   * invented. Fed to /api/compose-prompt as this clip's "Headline: ..."
+   * line in continueInStudio's merged prompt; left blank, that beat's line
+   * just has no headline at all rather than the model making one up.
+   */
+  headline: string;
 }
 
 export default function ReferenceEditor() {
@@ -453,6 +460,7 @@ function ReferenceEditorInner() {
             thumbnail,
             elements: [],
             snaps: [],
+            headline: "",
           },
         ]);
         setIncluded((prev) => ({ ...prev, [job.id]: true }));
@@ -517,6 +525,14 @@ function ReferenceEditorInner() {
       prev.map((c) =>
         c.job.id === clipId ? { ...c, elements: updater(c.elements) } : c,
       ),
+    );
+  }
+
+  /** Updates one clip's own on-screen headline text — see PreparedClip's
+   * `headline` doc comment. */
+  function setClipHeadline(clipId: string, headline: string) {
+    setClips((prev) =>
+      prev.map((c) => (c.job.id === clipId ? { ...c, headline } : c)),
     );
   }
 
@@ -679,18 +695,54 @@ function ReferenceEditorInner() {
   }
 
   /**
+   * Samples a handful of frames evenly across one clip's own trimmed
+   * duration — what composeReferencePrompt reads to describe that video's
+   * real cut rhythm and framing, since a chat model can be shown images but
+   * not handed a video file. Six is enough to read as "cuts happen roughly
+   * this often" without ballooning the request; best-effort, same as every
+   * other thumbnail capture in this file — a frame that fails to grab just
+   * comes back null and gets filtered out below rather than failing the
+   * whole hand-off.
+   */
+  async function sampleMotionFrames(job: ReferenceTransferJob) {
+    const COUNT = 6;
+    const duration = Math.max(0, job.referenceVideoDurationSeconds);
+    const atSeconds = Array.from(
+      { length: COUNT },
+      (_, i) => (duration * i) / Math.max(1, COUNT - 1),
+    );
+    const frames = await captureThumbnails(
+      job.referenceVideoUrl,
+      atSeconds,
+      512,
+      512,
+    );
+    return frames.filter((f): f is string => f !== null);
+  }
+
+  /**
    * Combines every included clip — and each of their snaps — into exactly
    * ONE job, instead of one job per clip. Reference → Video only ever
    * attaches a single video, so the first included clip's own video is
    * what carries over; but every included clip's own reference image(s)
    * (whatever that clip's own "Select objects" edit produced, same as a
    * single clip's snaps already fold together) are concatenated in
-   * selection order into one combined image-reference list, and every
-   * clip's own saved instruction text is concatenated the same way. The
-   * result is one generation fed by every scene's edit, in order, rather
-   * than N separate generations that only ever show one scene at a time
-   * (the old behavior — still available in spirit by just including one
-   * clip at a time and pressing Generate between each).
+   * selection order into one combined image-reference list — this is also
+   * exactly the "Image 1, Image 2, ..." order composeReferencePrompt is
+   * told about below. The result is one generation fed by every scene's
+   * edit, in order, rather than N separate generations that only ever show
+   * one scene at a time (the old behavior — still available in spirit by
+   * just including one clip at a time and pressing Generate between each).
+   *
+   * The prompt itself is now written by /api/compose-prompt rather than
+   * just concatenated from each clip's own typed instruction: it's handed
+   * the lead clip's sampled motion frames plus every combined image (each
+   * with whatever headline was typed for its clip, see PreparedClip.headline)
+   * and asked to write a full Reference → Video prompt in the style this
+   * was built from. That call is best-effort — on any failure (no API key
+   * configured, a network error, OpenAI refusing the request) this falls
+   * straight back to the old plain concatenation, so a broken or
+   * unconfigured prompt-writer never blocks getting to Studio at all.
    */
   async function continueInStudio() {
     if (selectedJobs.length === 0 || navigatingToStudio) return;
@@ -703,19 +755,6 @@ function ReferenceEditorInner() {
       );
 
       const [firstJob, ...restJobs] = perClipJobs;
-      const combinedImageUrls = perClipJobs
-        .flatMap((j) => j.referenceImageUrls)
-        .slice(0, model.maxReferences);
-      const combinedPrompt = perClipJobs
-        .map((j) => j.prompt.trim())
-        .filter((t) => t.length > 0)
-        .join("\n\n");
-
-      const mergedJob: ReferenceTransferJob = {
-        ...firstJob,
-        referenceImageUrls: combinedImageUrls,
-        prompt: combinedPrompt,
-      };
       // restJobs' own videos are deliberately dropped — only one video
       // reference can ever be attached, so the first included clip's video
       // is the one that reaches Studio; the rest contribute images and
@@ -723,6 +762,61 @@ function ReferenceEditorInner() {
       // future "which clip's video should lead?" picker has an obvious
       // place to plug in instead of this always silently picking "first".
       void restJobs;
+
+      // One entry per image in the final combined list, in order — the
+      // first image contributed by each clip carries that clip's own typed
+      // headline (if any); any further images from the same clip (extra
+      // elements, extra snaps) carry no headline of their own, since the
+      // beat they belong to already got one.
+      const beats = perClipJobs.flatMap((j, clipIndex) =>
+        j.referenceImageUrls.map((imageUrl, imageIndex) => ({
+          imageUrl,
+          headline:
+            imageIndex === 0
+              ? includedClips[clipIndex]?.headline.trim() || null
+              : null,
+        })),
+      );
+      const trimmedBeats = beats.slice(0, model.maxReferences);
+      const combinedImageUrls = trimmedBeats.map((b) => b.imageUrl);
+
+      const fallbackPrompt = perClipJobs
+        .map((j) => j.prompt.trim())
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+
+      let prompt = fallbackPrompt;
+      if (trimmedBeats.length > 0) {
+        try {
+          const motionFrameDataUrls = await sampleMotionFrames(firstJob);
+          const res = await fetch("/api/compose-prompt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              aspectRatio: firstJob.aspectRatio,
+              motionFrameDataUrls,
+              beats: trimmedBeats,
+            }),
+          });
+          const json = (await res.json().catch(() => null)) as {
+            prompt?: string;
+          } | null;
+          if (res.ok && json?.prompt?.trim()) {
+            prompt = json.prompt.trim();
+          }
+        } catch {
+          // Best-effort — fallbackPrompt (already computed above) carries
+          // this hand-off the rest of the way; see this function's own doc
+          // comment for why a broken prompt-writer must never block
+          // reaching Studio.
+        }
+      }
+
+      const mergedJob: ReferenceTransferJob = {
+        ...firstJob,
+        referenceImageUrls: combinedImageUrls,
+        prompt,
+      };
 
       writeReferenceTransfer([mergedJob]);
       // A full browser navigation, not router.push — Studio's mount effect
@@ -1254,6 +1348,23 @@ function ReferenceEditorInner() {
                         ? "Selections set — edit →"
                         : "Select objects →"}
                     </button>
+                    {/* This beat's on-screen text, if any — fed verbatim
+                        into /api/compose-prompt as this clip's own
+                        "Headline:" line (see PreparedClip.headline and
+                        continueInStudio). Click/focus stopped from
+                        bubbling so typing here doesn't also toggle the
+                        tile's own include checkbox, since the whole tile
+                        is a <label>. */}
+                    <input
+                      type="text"
+                      value={c.headline}
+                      onChange={(e) =>
+                        setClipHeadline(c.job.id, e.target.value)
+                      }
+                      onClick={(e) => e.stopPropagation()}
+                      placeholder="Headline for this beat (optional)"
+                      className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-[10px] text-ink-200 placeholder:text-ink-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
+                    />
                   </label>
                 );
               })}
