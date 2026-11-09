@@ -23,6 +23,8 @@
  * coherent prompt in the same voice.
  */
 
+import { truncateToChars } from "@/lib/text";
+
 interface Beat {
   imageUrl: string;
   headline: string | null;
@@ -40,6 +42,17 @@ interface ComposePromptParams {
    * left it blank (later images from the same clip, if any, carry null —
    * see how ReferenceEditor builds this list). */
   beats: Beat[];
+  /**
+   * The hard character cap on Studio's own prompt field for whichever model
+   * ReferenceEditor is about to hand this job to (model.maxPromptChars) —
+   * told to the model so it writes to the budget instead of running long,
+   * and enforced again after the fact (see composeReferencePrompt below)
+   * since an instruction in a system prompt is a strong hint, not a
+   * guarantee. Without this, a real prompt the person saw landed at 2746
+   * characters against a 2000-character field — correct in every other way,
+   * just silently too long to fit.
+   */
+  maxChars: number;
 }
 
 // Chat Completions, not the Responses API — the shape this app's one other
@@ -59,7 +72,9 @@ const SYSTEM_PROMPT = `You write prompts for an AI video generator's Reference �
 5. If there is more than one beat, one additional short beat line after the last numbered beat, describing the cuts continuing to cycle back through all the setups in order for the rest of the video's length.
 6. One closing paragraph starting "Look:" describing lighting, texture and color treatment consistent with what the reference images actually show, plus standard hygiene constraints: each object/subject keeps its exact shape and color across cuts, any on-screen text stays sharp and correctly spelled and doesn't move, no hands, no people, no extra objects beyond what's shown, no morphing between cuts, no logos.
 
-Output only the prompt text itself, nothing else — no preamble, no explanation, no quotation marks around the whole thing.`;
+Output only the prompt text itself, nothing else — no preamble, no explanation, no quotation marks around the whole thing.
+
+Hard limit: the finished prompt must fit inside {{MAX_CHARS}} characters total (that's the generator's own field limit, not a stylistic target) — write concisely enough to stay well under it rather than hitting the ceiling and getting cut off mid-sentence.`;
 
 function userContentParts(params: ComposePromptParams) {
   const parts: Array<
@@ -101,6 +116,12 @@ export async function composeReferencePrompt(
     throw new Error("Need at least one reference image to write a prompt from.");
   }
 
+  const maxChars = Math.max(1, Math.floor(params.maxChars));
+  const systemPrompt = SYSTEM_PROMPT.replace(
+    "{{MAX_CHARS}}",
+    String(maxChars),
+  );
+
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -110,7 +131,7 @@ export async function composeReferencePrompt(
     body: JSON.stringify({
       model: MODEL,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user", content: userContentParts(params) },
       ],
       temperature: 0.7,
@@ -132,5 +153,10 @@ export async function composeReferencePrompt(
   if (!text) {
     throw new Error("OpenAI returned no prompt text.");
   }
-  return text;
+  // The system prompt above asks the model to stay under maxChars itself —
+  // this is the backstop for when it doesn't, so Studio's prompt field
+  // never actually receives something over its own limit (the real bug
+  // report this fixes: a correct prompt that simply ran long, 2746 chars
+  // against a 2000-char field).
+  return truncateToChars(text, maxChars);
 }
