@@ -45,10 +45,21 @@ const Ctx = createContext<ConsentValue>({
 
 export function UploadConsentProvider({
   children,
+  defaultGranted = false,
 }: {
   children: React.ReactNode;
+  /**
+   * Seeds `granted` as already true — for the one case where that's honest
+   * rather than a shortcut: this composer's reference video/images all
+   * arrived via the Reference Editor hand-off, which already showed this
+   * same checkbox for these exact files and couldn't have uploaded them
+   * without it (/api/upload/sign refuses without consent). Still a normal,
+   * untruncated boolean the person can switch back off — this only changes
+   * where it starts, never what it enforces.
+   */
+  defaultGranted?: boolean;
 }) {
-  const [granted, setGranted] = useState(false);
+  const [granted, setGranted] = useState(defaultGranted);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   return (
     <Ctx.Provider value={{ granted, setGranted, busyKey, setBusyKey }}>
@@ -69,8 +80,44 @@ export function useUploadConsent() {
  * the same affordance as a selected option elsewhere in the composer, so it
  * reads as a setting rather than a warning.
  */
-export default function ConsentCheckbox() {
+export default function ConsentCheckbox({
+  collapsedByDefault = false,
+}: {
+  /**
+   * Starts as a single confirmed line ("Upload consent confirmed ·
+   * Review") instead of the full sentence-plus-checkbox — for the one case
+   * where the full text was already read and ticked moments earlier in the
+   * same session (see UploadConsentProvider's `defaultGranted`), so showing
+   * it again in full would just be the same sentence twice in one sitting.
+   * "Review" expands it back to the normal control, still live either way
+   * — collapsing is purely about what's on screen first, never about
+   * weakening the consent itself, and it never collapses on its own if the
+   * person un-ticks it after expanding.
+   */
+  collapsedByDefault?: boolean;
+}) {
   const { granted, setGranted } = useUploadConsent();
+  const [expanded, setExpanded] = useState(!collapsedByDefault);
+
+  if (!expanded) {
+    return (
+      <div className="flex items-center justify-between gap-2.5 rounded-lg border border-accent-500/45 bg-accent-500/[0.07] px-2.5 py-2">
+        <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-ink-200">
+          <span aria-hidden className="text-accent-400">
+            ✓
+          </span>
+          Upload consent confirmed in the Reference Editor
+        </span>
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="shrink-0 text-[11px] text-accent-400 underline underline-offset-2 hover:text-white"
+        >
+          Review
+        </button>
+      </div>
+    );
+  }
 
   return (
     <label
