@@ -34,10 +34,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Expected JSON" }, { status: 400 });
   }
 
-  const { aspectRatio, motionFrameDataUrls, beats } = (body ?? {}) as {
+  const { aspectRatio, motionFrameDataUrls, beats, maxChars } = (body ??
+    {}) as {
     aspectRatio?: unknown;
     motionFrameDataUrls?: unknown;
     beats?: unknown;
+    maxChars?: unknown;
   };
 
   const beatsValid =
@@ -52,6 +54,15 @@ export async function POST(req: Request) {
           typeof (b as { headline?: unknown }).headline === "string"),
     );
 
+  // Defaults to 2000 (the lowest maxPromptChars among this app's own
+  // reference-capable models — see lib/models.ts) rather than refusing the
+  // request outright: an old caller that predates this field is still safer
+  // truncated to the smallest reasonable limit than left uncapped.
+  const resolvedMaxChars =
+    typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars > 0
+      ? maxChars
+      : 2000;
+
   if (
     typeof aspectRatio !== "string" ||
     !aspectRatio ||
@@ -62,7 +73,7 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         error:
-          "Expected { aspectRatio: string, motionFrameDataUrls: string[], beats: { imageUrl: string, headline: string | null }[] }",
+          "Expected { aspectRatio: string, motionFrameDataUrls: string[], beats: { imageUrl: string, headline: string | null }[], maxChars?: number }",
       },
       { status: 400 },
     );
@@ -73,6 +84,7 @@ export async function POST(req: Request) {
       aspectRatio,
       motionFrameDataUrls,
       beats,
+      maxChars: resolvedMaxChars,
     });
     return NextResponse.json({ prompt }, { status: 200 });
   } catch (e) {
