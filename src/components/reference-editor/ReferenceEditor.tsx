@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
+import FlashOnView from "../FlashOnView";
 import TrimTimeline from "./TrimTimeline";
 import SceneObjectSelector from "./SceneObjectSelector";
 import ConsentCheckbox, {
@@ -99,13 +100,30 @@ interface SnapRecord {
    * same reason it lives outside SceneObjectSelector as PreparedClip's own
    * `elements` field (see below). */
   elements: ElementRecord[];
-  /** True once this snap's edits have been folded onto its parent clip's
-   * job via saveSnapPrompt. A snap that was only ever taken — never opened
-   * in "Select objects" — stays false forever, which is how
-   * continueInStudio (below) knows it still needs to upload that snap's
-   * raw frameDataUrl and append it as its own reference, rather than
-   * assuming every snap already made it into referenceImageUrls. */
+  /** True once this snap's edits have been folded in via saveSnapPrompt. A
+   * snap that was only ever taken — never opened in "Select objects" —
+   * stays false forever, which is how buildCombinedReferences (below)
+   * knows it still needs to upload that snap's raw frameDataUrl and append
+   * it as its own reference, rather than assuming every snap already
+   * contributed an image. */
   mergedIntoClip: boolean;
+  /**
+   * This snap's position in the final combined reference sequence —
+   * assigned once, the moment its edit is actually saved via
+   * saveSnapPrompt (never at take time: taking a snap is provisional,
+   * saving it is the deliberate act that fixes its place). Stays null for
+   * a snap that's never opened in "Select objects" at all; such a snap
+   * still contributes its raw frame (see buildCombinedReferences), it just
+   * has no explicit position, so it's placed after everything that does.
+   * Kept stable across re-saves of the same snap — editing it again updates
+   * its content, not its place in line.
+   */
+  seq: number | null;
+  /** This snap's own saved edit result — kept separate from the parent
+   * clip's `job` so saving a DIFFERENT snap, or the clip's own selector,
+   * can never silently overwrite it. Empty until mergedIntoClip is true. */
+  editedImageUrls: string[];
+  editedPrompt: string;
 }
 
 interface PreparedClip {
@@ -131,6 +149,24 @@ interface PreparedClip {
    * just has no headline at all rather than the model making one up.
    */
   headline: string;
+  /**
+   * The clip's OWN "Select objects" edit result — separate from any snap's
+   * (see SnapRecord.editedImageUrls/editedPrompt for the matching fields
+   * one level down), and separate from `job.referenceImageUrls`/`job.prompt`
+   * themselves, which buildCombinedReferences now writes to ONLY once, right
+   * before the hand-off to Studio, from this field plus every snap's own
+   * saved result — never incrementally as each edit is saved. That's the
+   * fix for a real data-loss bug this replaced: the old code wrote straight
+   * onto job.referenceImageUrls from whichever editor (the clip's own, or a
+   * snap's) was saved most recently, and the clip's own save *replaced* the
+   * whole list rather than merging — so saving the clip's own selection
+   * after a snap had already merged its images in silently wiped the
+   * snap's contribution out. Null until the clip's own selector has been
+   * saved at least once. `seq` is assigned once, the first time this is
+   * set, and kept stable on every re-save after that — same reasoning as
+   * SnapRecord.seq.
+   */
+  clipEdit: { seq: number; imageUrls: string[]; prompt: string } | null;
 }
 
 export default function ReferenceEditor() {
@@ -152,6 +188,12 @@ function ReferenceEditorInner() {
   // for.
   const jobSeq = useRef(0);
   const snapSeq = useRef(0);
+  // Shared across every clip's own "Select objects" save and every snap's
+  // own save, regardless of which clip or snap it belongs to — a single
+  // increasing counter is what lets buildCombinedReferences recover "the
+  // order the user actually committed these edits in" later, since nothing
+  // else records that (two saves a minute apart look identical otherwise).
+  const editSeq = useRef(0);
 
   const [stage, setStage] = useState<Stage>("empty");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -461,6 +503,7 @@ function ReferenceEditorInner() {
             elements: [],
             snaps: [],
             headline: "",
+            clipEdit: null,
           },
         ]);
         setIncluded((prev) => ({ ...prev, [job.id]: true }));
@@ -500,10 +543,16 @@ function ReferenceEditorInner() {
         c.job.id === clipId
           ? {
               ...c,
-              job: {
-                ...c.job,
+              // Stored on its own field, not written onto c.job — see
+              // PreparedClip.clipEdit's doc comment for why a direct write
+              // here used to silently erase whatever a snap had already
+              // contributed. `seq` is kept from a prior save so re-editing
+              // the same clip updates its content without moving its place
+              // in the final sequence.
+              clipEdit: {
+                seq: c.clipEdit?.seq ?? (editSeq.current += 1),
+                imageUrls: result.referenceImageUrls,
                 prompt: result.prompt,
-                referenceImageUrls: result.referenceImageUrls,
               },
             }
           : c,
@@ -562,6 +611,9 @@ function ReferenceEditorInner() {
         frameHeight: img.naturalHeight || 540,
         elements: [],
         mergedIntoClip: false,
+        seq: null,
+        editedImageUrls: [],
+        editedPrompt: "",
       };
       setClips((prev) =>
         prev.map((c) =>
@@ -615,13 +667,11 @@ function ReferenceEditorInner() {
 
   /**
    * A snap isn't its own destination (see SnapRecord's doc comment) — Save
-   * here folds its Dataset 2 onto the parent clip's existing job instead of
-   * replacing it the way savePromptForClip does for the clip's own
-   * selector: image references are appended (capped at the current model's
-   * own reference limit, so stacking several snaps' edits onto one clip
-   * can't silently produce more slots than Mic Studio actually has), and
-   * the prompt text is appended as a further paragraph so the snap's own
-   * instructions aren't lost.
+   * here stores its Dataset 2 on the snap itself (editedImageUrls/
+   * editedPrompt), NOT on the parent clip's job. `seq` is kept from a prior
+   * save so re-editing the same snap updates its content without moving
+   * its place in the final sequence (see buildCombinedReferences, which is
+   * what actually reads this into the hand-off to Studio).
    */
   function saveSnapPrompt(
     clipId: string,
@@ -631,23 +681,18 @@ function ReferenceEditorInner() {
     setClips((prev) =>
       prev.map((c) => {
         if (c.job.id !== clipId) return c;
-        const mergedImageUrls = [
-          ...c.job.referenceImageUrls,
-          ...result.referenceImageUrls,
-        ].slice(0, model.maxReferences);
-        const mergedPrompt = [c.job.prompt, result.prompt]
-          .map((t) => t.trim())
-          .filter((t) => t.length > 0)
-          .join("\n\n");
         return {
           ...c,
-          job: {
-            ...c.job,
-            referenceImageUrls: mergedImageUrls,
-            prompt: mergedPrompt,
-          },
           snaps: c.snaps.map((s) =>
-            s.id === snapId ? { ...s, mergedIntoClip: true } : s,
+            s.id === snapId
+              ? {
+                  ...s,
+                  mergedIntoClip: true,
+                  seq: s.seq ?? (editSeq.current += 1),
+                  editedImageUrls: result.referenceImageUrls,
+                  editedPrompt: result.prompt,
+                }
+              : s,
           ),
         };
       }),
@@ -656,41 +701,73 @@ function ReferenceEditorInner() {
   }
 
   /**
-   * Besides the edited snaps saveSnapPrompt already folds in, a snap that
-   * was only ever taken — never opened in "Select objects", so
-   * mergedIntoClip is still false — has nothing in referenceImageUrls yet:
-   * its only record is the raw frameDataUrl sitting in memory. This uploads
-   * each such snap's frame (same uploadMedia path a clip's own trimmed
-   * video goes through) and appends the resulting URL, capped at the
-   * model's own reference limit just like saveSnapPrompt does, so every
-   * snap taken — edited or not — ends up as a reference once the user
-   * continues to Studio.
+   * Builds one clip's final combined reference list and prompt text, right
+   * before the hand-off to Studio — replacing the old approach of writing
+   * incrementally onto job.referenceImageUrls from inside savePromptForClip
+   * and saveSnapPrompt as each edit was saved. That approach lost data: the
+   * clip's own save *replaced* the whole list rather than merging, so
+   * saving the clip's own selection after a snap had already merged its
+   * images in silently wiped the snap's contribution out (see
+   * PreparedClip.clipEdit's doc comment).
+   *
+   * Order here reflects the order the user actually committed each edit in
+   * — the clip's own "Select objects" save and every snap's own save all
+   * share one sequence counter (editSeq) — rather than "the clip's video
+   * frame first, then every snap" or take-order, either of which would
+   * silently reorder a beat the user deliberately edited out of sequence.
+   * A snap that was only ever taken, never opened in "Select objects", has
+   * no seq at all (saving is what assigns one) — its raw frame still
+   * contributes, uploaded fresh here the same way it always did, but since
+   * the user never expressed an explicit position for it, it's placed
+   * after everything that does have one, in the order it was taken.
    */
-  async function appendUnmergedSnaps(
-    job: ReferenceTransferJob,
-    snaps: SnapRecord[],
-  ): Promise<ReferenceTransferJob> {
-    const unmerged = snaps.filter((s) => !s.mergedIntoClip);
-    if (unmerged.length === 0) return job;
-    const uploaded: string[] = [];
-    for (const s of unmerged) {
+  async function buildCombinedReferences(
+    clip: PreparedClip,
+  ): Promise<{ imageUrls: string[]; prompt: string }> {
+    type Contribution = { seq: number; imageUrls: string[]; prompt: string };
+    const ordered: Contribution[] = [];
+    const unordered: Contribution[] = [];
+
+    if (clip.clipEdit) {
+      ordered.push({
+        seq: clip.clipEdit.seq,
+        imageUrls: clip.clipEdit.imageUrls,
+        prompt: clip.clipEdit.prompt,
+      });
+    }
+
+    for (const s of clip.snaps) {
+      if (s.mergedIntoClip && s.seq != null) {
+        ordered.push({
+          seq: s.seq,
+          imageUrls: s.editedImageUrls,
+          prompt: s.editedPrompt,
+        });
+        continue;
+      }
+      // Never opened in "Select objects" — its only contribution is its
+      // own raw captured frame, uploaded fresh here (same path a clip's
+      // own trimmed video goes through).
       try {
         const blob = await (await fetch(s.frameDataUrl)).blob();
         const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
         const url = await uploadMedia(file, "image", granted);
-        uploaded.push(url);
+        unordered.push({ seq: 0, imageUrls: [url], prompt: "" });
       } catch {
         // Best-effort — one snap failing to upload shouldn't block the
-        // rest of the handoff to Studio.
+        // rest of the hand-off to Studio.
       }
     }
-    if (uploaded.length === 0) return job;
+
+    ordered.sort((a, b) => a.seq - b.seq);
+    const all = [...ordered, ...unordered];
+
     return {
-      ...job,
-      referenceImageUrls: [...job.referenceImageUrls, ...uploaded].slice(
-        0,
-        model.maxReferences,
-      ),
+      imageUrls: all.flatMap((c) => c.imageUrls).slice(0, model.maxReferences),
+      prompt: all
+        .map((c) => c.prompt.trim())
+        .filter((t) => t.length > 0)
+        .join("\n\n"),
     };
   }
 
@@ -751,7 +828,14 @@ function ReferenceEditorInner() {
     try {
       const includedClips = clips.filter((c) => included[c.job.id] !== false);
       const perClipJobs = await Promise.all(
-        includedClips.map((c) => appendUnmergedSnaps(c.job, c.snaps)),
+        includedClips.map(async (c) => {
+          const built = await buildCombinedReferences(c);
+          return {
+            ...c.job,
+            referenceImageUrls: built.imageUrls,
+            prompt: built.prompt,
+          };
+        }),
       );
 
       const [firstJob, ...restJobs] = perClipJobs;
@@ -845,11 +929,13 @@ function ReferenceEditorInner() {
         <h1 className="text-2xl font-semibold tracking-tight text-white">
           Reference Editor
         </h1>
-        <p className="mt-1 text-sm text-ink-400">
-          Trim a source clip down to a real reference video, sized to fit
-          whichever model you&apos;ll generate with, then send it straight
-          into Mic Studio.
-        </p>
+        <FlashOnView>
+          <p className="mt-1 text-sm text-ink-400">
+            Trim a source clip down to a real reference video, sized to fit
+            whichever model you&apos;ll generate with, then send it straight
+            into Mic Studio.
+          </p>
+        </FlashOnView>
       </div>
 
       {/* --- 1. Media input --------------------------------------------- */}
@@ -1175,13 +1261,15 @@ function ReferenceEditorInner() {
                 ? `${prepareLabel} ${Math.round(prepareProgress * 100)}%`
                 : "Prepare clip(s)"}
             </button>
-            <p className="text-center text-[11px] text-ink-400">
-              This finds scene cuts inside your selection, trims each one
-              into its own reference clip, right here in the browser — no
-              file leaves your device until each clip is uploaded. The first
-              clip may take a little longer while the trimming engine itself
-              downloads.
-            </p>
+            <FlashOnView>
+              <p className="text-center text-[11px] text-ink-400">
+                This finds scene cuts inside your selection, trims each one
+                into its own reference clip, right here in the browser — no
+                file leaves your device until each clip is uploaded. The
+                first clip may take a little longer while the trimming
+                engine itself downloads.
+              </p>
+            </FlashOnView>
           </div>
         </div>
       )}
@@ -1207,6 +1295,21 @@ function ReferenceEditorInner() {
             select objects on it — whatever you save there is added onto the
             clip&apos;s own image references below.
           </p>
+          {/* The order-matters hint — first thing a person sees once a
+              second potential contribution (a snap, alongside the clip's
+              own "Select objects") exists at all, which is exactly the
+              moment picking an edit order starts to matter. Flashes once on
+              first view (FlashOnView) since it's easy to skim past
+              otherwise, and stays concrete rather than abstract: it names
+              the actual mechanism (Image 1, Image 2, ...) instead of just
+              saying "order matters". */}
+          <FlashOnView>
+            <p className="rounded-md border border-accent-500/30 bg-accent-500/[0.08] px-2.5 py-1.5 text-[11px] leading-snug text-accent-400">
+              Save order matters: whichever snap or selection you save
+              first becomes Image 1 in Mic Studio, the next becomes Image 2,
+              and so on — not the order these tiles are laid out in.
+            </p>
+          </FlashOnView>
           <div className="flex flex-wrap gap-2">
             {activeClip.snaps.map((s) => (
               <button
@@ -1344,7 +1447,7 @@ function ReferenceEditorInner() {
                       }}
                       className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-center text-[10px] text-accent-400 hover:bg-ink-850 hover:text-white"
                     >
-                      {c.job.prompt
+                      {c.clipEdit
                         ? "Selections set — edit →"
                         : "Select objects →"}
                     </button>
