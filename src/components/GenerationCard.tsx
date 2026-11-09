@@ -6,6 +6,7 @@ import { usd } from "@/lib/format";
 import { creditLabel } from "@/lib/pricing";
 import { QUALITY_LABEL } from "@/lib/models";
 import { shortTitle } from "@/lib/title";
+import { downloadFile } from "@/lib/download";
 import SaveClip from "./SaveClip";
 import {
   UPSCALE_LABEL,
@@ -204,6 +205,17 @@ function UpscaleRow({
 }) {
   const [busy, setBusy] = useState<UpscaleTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
+
+  async function handleDownload(url: string, filename: string) {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      await downloadFile(url, filename);
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   const running =
     g.upscale_status === "queued" || g.upscale_status === "processing";
@@ -236,14 +248,20 @@ function UpscaleRow({
         <span className="rounded border border-accent-500/40 bg-accent-500/10 px-1.5 py-0.5 text-accent-400">
           {UPSCALE_LABEL[g.upscale_target ?? "4k"]} master
         </span>
-        <a
-          href={g.upscale_url}
-          download={`${g.id}-${g.upscale_target ?? "4k"}.mp4`}
-          className="text-ink-300 transition hover:text-white"
+        <button
+          type="button"
+          disabled={downloading}
+          onClick={() =>
+            void handleDownload(
+              g.upscale_url!,
+              `${g.id}-${g.upscale_target ?? "4k"}.mp4`,
+            )
+          }
+          className="text-ink-300 transition hover:text-white disabled:opacity-50"
           title="Provider links expire — save this now."
         >
-          Download ↓
-        </a>
+          {downloading ? "Downloading…" : "Download ↓"}
+        </button>
       </div>
     );
   }
@@ -270,13 +288,14 @@ function UpscaleRow({
               {busy === t ? "…" : UPSCALE_LABEL[t]}
             </button>
           ))}
-          <a
-            href={g.video_url!}
-            download={`${g.id}.mp4`}
-            className="rounded border border-ink-700 px-2 py-0.5 transition hover:border-accent-500 hover:text-white"
+          <button
+            type="button"
+            disabled={downloading}
+            onClick={() => void handleDownload(g.video_url!, `${g.id}.mp4`)}
+            className="rounded border border-ink-700 px-2 py-0.5 transition hover:border-accent-500 hover:text-white disabled:opacity-50"
           >
-            ↓
-          </a>
+            {downloading ? "…" : "↓"}
+          </button>
         </div>
       </div>
       {(error ?? g.upscale_error) && (
