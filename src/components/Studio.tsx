@@ -570,6 +570,13 @@ export default function Studio({
             }
             referenceProCents={referenceProCents}
             referenceFourKCents={referenceFourKCents}
+            // The video/images already sitting in this composer came from
+            // the Reference Editor's own upload flow, which enforces the
+            // same consent checkbox server-side (see /api/upload/sign) —
+            // so asking again here for files that are already uploaded
+            // would just be the same sentence a second time in one sitting.
+            // `transfer` is only ever non-null right after that hand-off.
+            consentPreGranted={!!transfer}
           />
 
           {/* Mounted only where an auth call can still happen. For a signed-in
