@@ -71,6 +71,7 @@ export default function Composer({
   onLocked,
   referenceProCents,
   referenceFourKCents,
+  consentPreGranted = false,
 }: {
   value: ComposerValue;
   onChange: (v: ComposerValue) => void;
@@ -118,6 +119,18 @@ export default function Composer({
    */
   referenceProCents?: number;
   referenceFourKCents?: number;
+  /**
+   * True when every reference already sitting in `value` (video and/or
+   * images) arrived via the Reference Editor hand-off rather than being
+   * uploaded from this composer — meaning the same consent checkbox was
+   * already shown, read, and ticked there, for these exact files, minutes
+   * earlier in the same session (enforced server-side too, at
+   * /api/upload/sign: Reference Editor's upload could not have succeeded
+   * without it). Default false, so a composer opened any other way still
+   * asks the normal way. See ConsentCheckbox's `defaultGranted`/`collapsed`
+   * props for what this changes on screen.
+   */
+  consentPreGranted?: boolean;
 }) {
   const [showReferenceCreditNotice, setShowReferenceCreditNotice] =
     useState(false);
@@ -415,9 +428,9 @@ export default function Composer({
           there is actually something to upload — a text-to-video user is not
           asked to affirm anything about files they never provide. */}
       {(isReference || usesFrames) && (
-        <UploadConsentProvider>
+        <UploadConsentProvider defaultGranted={consentPreGranted}>
           <div className="space-y-3">
-            <ConsentCheckbox />
+            <ConsentCheckbox collapsedByDefault={consentPreGranted} />
 
             {isReference && (
               <ReferencePanel
