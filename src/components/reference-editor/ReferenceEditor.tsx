@@ -9,6 +9,7 @@ import ConsentCheckbox, {
   useUploadConsent,
 } from "@/components/UploadConsent";
 import { uploadMedia } from "@/lib/upload";
+import { downloadFile } from "@/lib/download";
 import { extractClip, planScenesFromCuts } from "@/lib/videoClip";
 import { detectSceneCuts } from "@/lib/sceneDetect";
 import { captureThumbnail, captureThumbnails } from "@/lib/videoThumbnail";
@@ -17,6 +18,7 @@ import {
   writeReferenceTransfer,
   type ReferenceTransferJob,
 } from "@/lib/referenceTransfer";
+import { truncateToChars } from "@/lib/text";
 import type { ElementRecord } from "@/lib/promptCombiner";
 import { extractYouTubeVideoId, type YouTubeLicense } from "@/lib/youtube";
 
@@ -169,6 +171,26 @@ interface PreparedClip {
   clipEdit: { seq: number; imageUrls: string[]; prompt: string } | null;
 }
 
+/**
+ * What a snap's own thumbnail should actually show. Previously always
+ * `s.frameDataUrl` — the raw captured still, forever, even once that snap
+ * had gone through "Select objects" and the person had an AI-edited result
+ * sitting right there (e.g. "Add Orange with drone view."). The tile never
+ * updated to reflect it, so the thumbnail looked stuck on the original frame
+ * no matter how many edits were saved. This now prefers the most recent
+ * saved edit result — the last image in `editedImageUrls`, since
+ * saveSnapPrompt's `referenceImageUrls` already carries that edit's actual
+ * images in order — and only falls back to the raw frame for a snap that's
+ * never been merged, or (the buildCombinedReferences fallback case) was
+ * saved with no image of its own at all.
+ */
+function snapPreviewUrl(s: SnapRecord): string {
+  if (s.mergedIntoClip && s.editedImageUrls.length > 0) {
+    return s.editedImageUrls[s.editedImageUrls.length - 1];
+  }
+  return s.frameDataUrl;
+}
+
 export default function ReferenceEditor() {
   return (
     <UploadConsentProvider>
@@ -212,6 +234,32 @@ function ReferenceEditorInner() {
   // means "included": a clip is on by default the moment it appears, with
   // no flash of being unchecked first.
   const [included, setIncluded] = useState<Record<string, boolean>>({});
+  // Same idea, one level down: which snaps actually contribute their
+  // image(s) to the final hand-off. Keyed by snap id, absence means
+  // "included" — same default-on convention as `included` above, so an
+  // unchecked box is always something the person actively did, never a
+  // silent default.
+  const [snapIncluded, setSnapIncluded] = useState<Record<string, boolean>>(
+    {},
+  );
+  // Which single thumbnail (a snap, or a clip's own video) is mid-download —
+  // one id at a time is plenty; this only disables that one control while
+  // its own fetch-to-blob is in flight (see lib/download.ts).
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  async function handleThumbnailDownload(
+    id: string,
+    url: string,
+    filename: string,
+  ) {
+    if (downloadingId) return;
+    setDownloadingId(id);
+    try {
+      await downloadFile(url, filename);
+    } finally {
+      setDownloadingId(null);
+    }
+  }
   // Which clip's object/background selector is open — null when closed.
   // Only one at a time; the selector is a full-screen modal.
   const [selectorClipId, setSelectorClipId] = useState<string | null>(null);
@@ -720,6 +768,25 @@ function ReferenceEditorInner() {
    * contributes, uploaded fresh here the same way it always did, but since
    * the user never expressed an explicit position for it, it's placed
    * after everything that does have one, in the order it was taken.
+   *
+   * A snap unchecked via its own "include" checkbox is skipped entirely —
+   * see `snapIncluded` above.
+   *
+   * One more case, previously a real data-loss bug: a snap can be opened in
+   * "Select objects", given a typed instruction, and saved (Done) without
+   * ever attaching a reference image or pressing Send on the ✨ chat — that
+   * instruction alone is enough for buildCombinedPrompt to mark the element
+   * "completed" (see promptCombiner.ts), but it then has nothing to put in
+   * `attachments`, so the snap's own saveSnapPrompt call lands with an
+   * empty `referenceImageUrls` array. Before this fix, a merged snap was
+   * trusted to always carry its own image(s) and the "never opened" raw-
+   * frame fallback below only ran for snaps that were never merged at all —
+   * so this exact snap silently contributed zero images AND skipped the raw
+   * frame, vanishing from the hand-off entirely. That's "sometimes it's
+   * transferring the images and sometimes not" when the only thing done on
+   * a snap was typing text: this now falls through to the same raw-frame
+   * upload, just keeping the snap's seq/prompt so it still lands in the
+   * place the person saved it.
    */
   async function buildCombinedReferences(
     clip: PreparedClip,
@@ -737,7 +804,8 @@ function ReferenceEditorInner() {
     }
 
     for (const s of clip.snaps) {
-      if (s.mergedIntoClip && s.seq != null) {
+      if (snapIncluded[s.id] === false) continue;
+      if (s.mergedIntoClip && s.seq != null && s.editedImageUrls.length > 0) {
         ordered.push({
           seq: s.seq,
           imageUrls: s.editedImageUrls,
@@ -745,14 +813,22 @@ function ReferenceEditorInner() {
         });
         continue;
       }
-      // Never opened in "Select objects" — its only contribution is its
-      // own raw captured frame, uploaded fresh here (same path a clip's
-      // own trimmed video goes through).
+      // Either never opened in "Select objects" at all, or opened and saved
+      // with no attached/generated image (see doc comment above) — either
+      // way, fall back to uploading its own raw captured frame fresh here
+      // (same path a clip's own trimmed video goes through) rather than
+      // contributing nothing.
       try {
         const blob = await (await fetch(s.frameDataUrl)).blob();
         const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
         const url = await uploadMedia(file, "image", granted);
-        unordered.push({ seq: 0, imageUrls: [url], prompt: "" });
+        if (s.mergedIntoClip && s.seq != null) {
+          // Saved with a real instruction, just no image of its own — keep
+          // its place in the sequence and its prompt text.
+          ordered.push({ seq: s.seq, imageUrls: [url], prompt: s.editedPrompt });
+        } else {
+          unordered.push({ seq: 0, imageUrls: [url], prompt: "" });
+        }
       } catch {
         // Best-effort — one snap failing to upload shouldn't block the
         // rest of the hand-off to Studio.
@@ -880,6 +956,12 @@ function ReferenceEditorInner() {
               aspectRatio: firstJob.aspectRatio,
               motionFrameDataUrls,
               beats: trimmedBeats,
+              // The model this hand-off is actually loading Studio into —
+              // its own field cap is what the composed prompt has to fit,
+              // not some other model's. See promptWriter.ts's doc comment:
+              // this is the fix for a real, correct prompt that simply ran
+              // long (2746 chars against this model's 2000-char field).
+              maxChars: model.maxPromptChars,
             }),
           });
           const json = (await res.json().catch(() => null)) as {
@@ -894,6 +976,16 @@ function ReferenceEditorInner() {
           // comment for why a broken prompt-writer must never block
           // reaching Studio.
         }
+      }
+
+      // Defensive cap, independent of whether /api/compose-prompt ran at
+      // all: the plain-concatenation fallback (every clip/snap's own typed
+      // instruction, joined) has no length awareness of its own either, and
+      // is exactly what ships when OPENAI_API_KEY isn't configured or the
+      // call above failed outright — so it needs the same ceiling applied
+      // here rather than trusting either path to have already respected it.
+      if (prompt.length > model.maxPromptChars) {
+        prompt = truncateToChars(prompt, model.maxPromptChars);
       }
 
       const mergedJob: ReferenceTransferJob = {
@@ -1293,7 +1385,8 @@ function ReferenceEditorInner() {
           <p className="text-[11px] text-ink-400">
             Extra frames grabbed from the trim timeline above. Tap one to
             select objects on it — whatever you save there is added onto the
-            clip&apos;s own image references below.
+            clip&apos;s own image references below. Uncheck a snap to leave
+            it out of the hand-off entirely.
           </p>
           {/* The order-matters hint — first thing a person sees once a
               second potential contribution (a snap, alongside the clip's
@@ -1311,31 +1404,76 @@ function ReferenceEditorInner() {
             </p>
           </FlashOnView>
           <div className="flex flex-wrap gap-2">
-            {activeClip.snaps.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                onClick={() =>
-                  setSelectorSnap({ clipId: activeClip.job.id, snapId: s.id })
-                }
-                title={
-                  s.elements.some((el) => el.status === "completed")
-                    ? "Snap — selections set, edit →"
-                    : "Snap — select objects →"
-                }
-                className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-ink-650 hover:border-accent-400"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={s.frameDataUrl}
-                  alt=""
-                  className="h-full w-full object-cover"
-                />
-                {s.elements.some((el) => el.status === "completed") && (
-                  <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
-                )}
-              </button>
-            ))}
+            {activeClip.snaps.map((s) => {
+              const isIncluded = snapIncluded[s.id] !== false;
+              const preview = snapPreviewUrl(s);
+              const downloading = downloadingId === s.id;
+              return (
+                <div
+                  key={s.id}
+                  className={`relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border transition ${
+                    isIncluded
+                      ? "border-ink-650 hover:border-accent-400"
+                      : "border-ink-650 opacity-40"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectorSnap({
+                        clipId: activeClip.job.id,
+                        snapId: s.id,
+                      })
+                    }
+                    title={
+                      s.elements.some((el) => el.status === "completed")
+                        ? "Snap — selections set, edit →"
+                        : "Snap — select objects →"
+                    }
+                    className="absolute inset-0 h-full w-full"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={preview}
+                      alt=""
+                      className="h-full w-full object-cover"
+                    />
+                    {s.elements.some((el) => el.status === "completed") && (
+                      <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
+                    )}
+                  </button>
+                  <input
+                    type="checkbox"
+                    checked={isIncluded}
+                    title="Include this snap in the hand-off to Mic Studio"
+                    onChange={(e) =>
+                      setSnapIncluded((prev) => ({
+                        ...prev,
+                        [s.id]: e.target.checked,
+                      }))
+                    }
+                    className="absolute left-1 top-1 z-10 h-3.5 w-3.5 accent-accent-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={downloading}
+                    title="Download this snap as an image"
+                    aria-label="Download this snap as an image"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleThumbnailDownload(
+                        s.id,
+                        preview,
+                        `${s.id}.jpg`,
+                      );
+                    }}
+                    className="absolute bottom-1 left-1 z-10 flex h-4 w-4 items-center justify-center rounded bg-black/70 text-[10px] text-white hover:bg-black disabled:opacity-60"
+                  >
+                    {downloading ? "…" : "↓"}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -1420,20 +1558,61 @@ function ReferenceEditorInner() {
                         No preview
                       </div>
                     )}
-                    <div className="flex items-center justify-between bg-ink-850 px-2 py-1 text-[10px] text-ink-300">
-                      <span>
+                    {c.thumbnail && (
+                      <button
+                        type="button"
+                        disabled={downloadingId === `${c.job.id}-thumb`}
+                        title="Download this scene's thumbnail as an image"
+                        aria-label="Download this scene's thumbnail as an image"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          void handleThumbnailDownload(
+                            `${c.job.id}-thumb`,
+                            c.thumbnail!,
+                            `scene-${i + 1}.jpg`,
+                          );
+                        }}
+                        className="absolute left-1.5 top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded bg-black/70 text-[11px] text-white hover:bg-black disabled:opacity-60"
+                      >
+                        {downloadingId === `${c.job.id}-thumb` ? "…" : "🖼"}
+                      </button>
+                    )}
+                    <div className="flex items-center justify-between gap-1.5 bg-ink-850 px-2 py-1 text-[10px] text-ink-300">
+                      <span className="truncate">
                         Scene {i + 1} ·{" "}
                         {c.job.referenceVideoDurationSeconds.toFixed(1)}s
                       </span>
-                      <a
-                        href={c.job.referenceVideoUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="text-accent-400 underline underline-offset-2 hover:text-white"
-                      >
-                        ↗
-                      </a>
+                      <span className="flex shrink-0 items-center gap-2">
+                        <a
+                          href={c.job.referenceVideoUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open this clip's video"
+                          onClick={(e) => e.stopPropagation()}
+                          className="text-accent-400 underline underline-offset-2 hover:text-white"
+                        >
+                          ↗
+                        </a>
+                        <button
+                          type="button"
+                          disabled={downloadingId === c.job.id}
+                          title="Download this clip's video"
+                          aria-label="Download this clip's video"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void handleThumbnailDownload(
+                              c.job.id,
+                              c.job.referenceVideoUrl,
+                              `scene-${i + 1}.mp4`,
+                            );
+                          }}
+                          className="text-accent-400 hover:text-white disabled:opacity-60"
+                        >
+                          {downloadingId === c.job.id ? "…" : "↓"}
+                        </button>
+                      </span>
                     </div>
                     <button
                       type="button"
