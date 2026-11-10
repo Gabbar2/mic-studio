@@ -139,49 +139,92 @@ export interface Dataset2 {
  * `attachments` (and therefore in Mic Studio's own image-reference slots —
  * see the Dataset2 doc comment above) depends on whether that element has
  * gone through the ✨ chat's real edit yet:
- *  - `generatedImageUrl` set: that one finished, already-edited frame *is*
- *    this element's entry — the point of generating it was for this exact
- *    image to be what Mic Studio receives, not a picture of what to aim
- *    for.
- *  - `generatedImageUrl` still null (nobody has pressed Send yet, or this
- *    clip predates the AI-edit feature): falls back to whatever reference
- *    images were manually attached, same as before this feature existed —
- *    so an element with only a written instruction and no generated result
- *    still folds in cleanly rather than contributing nothing.
+ *  - `generatedImageUrl` set, AND a session-wide `combinedFrameUrl` was
+ *    passed in: this element was part of this session's *chained* AI edit
+ *    — see SceneObjectSelector's `sessionImageUrl`, which feeds every
+ *    element's Send through the previous edit's own result rather than
+ *    always starting over from the original frame, so one element's edit
+ *    is still visible in the frame by the time the next element's edit
+ *    runs. Because of that, every chained element's actual pixels live in
+ *    that ONE final composited image, not in each element's own
+ *    `generatedImageUrl` individually (which, once a later element has
+ *    been edited on top of it, is a stale intermediate frame) — so a
+ *    chained element contributes no attachment of its own at all; it just
+ *    points at the one shared `combinedFrameUrl` entry (Attachment 1),
+ *    registered once up front. This is the fix for "two elements edited in
+ *    one sitting land as two separate, each-only-half-edited images in Mic
+ *    Studio" — they now land as the one fully-combined frame instead.
+ *  - `generatedImageUrl` set, but no `combinedFrameUrl` (nobody sent an AI
+ *    edit *this* session — e.g. reopening an already-saved clip/snap
+ *    without touching anything further): falls back to the old per-element
+ *    behavior below, each element's own stored `generatedImageUrl` as its
+ *    own attachment — the best available answer when there's no live chain
+ *    to point at.
+ *  - `generatedImageUrl` still null (nobody has pressed Send for this
+ *    element at all, or this clip predates the AI-edit feature): falls
+ *    back to whatever reference images were manually attached, same as
+ *    before this feature existed — so an element with only a written
+ *    instruction and no generated result still folds in cleanly rather
+ *    than contributing nothing.
  */
-export function buildCombinedPrompt(elements: ElementRecord[]): Dataset2 {
+export function buildCombinedPrompt(
+  elements: ElementRecord[],
+  combinedFrameUrl: string | null = null,
+): Dataset2 {
   const attachments: Dataset2AttachmentRef[] = [];
   const datasetElements: Dataset2Element[] = [];
   const blocks: string[] = [];
   let refCounter = 0;
 
+  // Registered once, up front, so every chained element below can point at
+  // the same attachment number rather than each minting its own — see the
+  // doc comment above.
+  let combinedRefNumber: number | null = null;
+  if (combinedFrameUrl) {
+    refCounter += 1;
+    combinedRefNumber = refCounter;
+    attachments.push({
+      referenceNumber: refCounter,
+      attachmentId: "combined_edit",
+      elementId: "__combined__",
+      url: combinedFrameUrl,
+      type: "image",
+    });
+  }
+
   elements.forEach((el, i) => {
     const nums: number[] = [];
-    const images: { attachmentId: string; url: string; type: "image" }[] =
-      el.generatedImageUrl
-        ? [
-            {
-              attachmentId: `generated_${el.elementId}`,
-              url: el.generatedImageUrl,
-              type: "image",
-            },
-          ]
-        : el.attachments.map((a) => ({
-            attachmentId: a.attachmentId,
-            url: a.url,
-            type: "image" as const,
-          }));
+    const wasChained = !!el.generatedImageUrl && combinedRefNumber != null;
 
-    for (const a of images) {
-      refCounter += 1;
-      attachments.push({
-        referenceNumber: refCounter,
-        attachmentId: a.attachmentId,
-        elementId: el.elementId,
-        url: a.url,
-        type: a.type,
-      });
-      nums.push(refCounter);
+    if (wasChained) {
+      nums.push(combinedRefNumber!);
+    } else {
+      const images: { attachmentId: string; url: string; type: "image" }[] =
+        el.generatedImageUrl
+          ? [
+              {
+                attachmentId: `generated_${el.elementId}`,
+                url: el.generatedImageUrl,
+                type: "image",
+              },
+            ]
+          : el.attachments.map((a) => ({
+              attachmentId: a.attachmentId,
+              url: a.url,
+              type: "image" as const,
+            }));
+
+      for (const a of images) {
+        refCounter += 1;
+        attachments.push({
+          referenceNumber: refCounter,
+          attachmentId: a.attachmentId,
+          elementId: el.elementId,
+          url: a.url,
+          type: a.type,
+        });
+        nums.push(refCounter);
+      }
     }
 
     // "Image N" / "@ImageN", not "Attachment N" — these have to read as the
