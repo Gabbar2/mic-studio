@@ -239,6 +239,37 @@ export default function SceneObjectSelector({
 
   const [showIncompleteWarning, setShowIncompleteWarning] = useState(false);
 
+  /**
+   * The one running composite frame every element's edit builds onto,
+   * across the whole session — what makes editing two different elements
+   * ("add orange" on one region, "drone view" on another) land as ONE
+   * image showing both, instead of two separate images each only showing
+   * its own edit. Every Send, regardless of which element's chat it comes
+   * from, reads this as its starting image (see sendComposedMessage) and
+   * writes its result back here — so the chain is strictly "whatever was
+   * sent most recently, across every element," not per-element. Finalize
+   * hands this (not any one element's own generatedImageUrl) to
+   * buildCombinedPrompt as the single combined reference image.
+   *
+   * Initialized from whichever element (searched last-to-first, since nothing
+   * records which one was truly edited most recently across a *previous*
+   * session) already has a saved `generatedImageUrl`, so reopening a
+   * partially-edited clip/snap and editing one more element still chains
+   * onto earlier work instead of silently resetting to the untouched frame.
+   * Stays null — meaning "nothing's been AI-edited yet this session" — until
+   * the first successful Send; buildCombinedPrompt treats that null case as
+   * "fall back to each element's own stored image/attachments," which is
+   * also what makes a reopen-with-no-further-edits round-trip unchanged.
+   */
+  const [sessionImageUrl, setSessionImageUrl] = useState<string | null>(
+    () => {
+      for (let i = elements.length - 1; i >= 0; i--) {
+        if (elements[i].generatedImageUrl) return elements[i].generatedImageUrl;
+      }
+      return null;
+    },
+  );
+
   useEffect(() => {
     let cancelled = false;
 
@@ -702,13 +733,46 @@ export default function SceneObjectSelector({
    * component never needs to know which one is active — it just renders
    * whatever comes back, labeled if it was a mock run.
    *
+   * Two things make a follow-up like "just one, not multiple" actually
+   * read as a follow-up instead of a fresh, unrelated instruction — OpenAI's
+   * edit endpoint has no memory between calls, it only sees whatever single
+   * image+mask+prompt this one request sends:
+   *   - `imageUrl` is the most recent generated result once there is one,
+   *     not always the original frame — so the edit lands on the apple
+   *     photo that's already on screen, not back on the untouched original.
+   *   - `prompt` resends every earlier instruction in this thread (oldest
+   *     first) plus the one just typed, joined into one block — so "with a
+   *     drone view" from two messages ago is still part of what the model
+   *     reads this time, not lost the moment the next message is sent.
+   *
+   * That "most recent generated result" is `sessionImageUrl`, not this one
+   * element's own `lastGeneratedUrl` — deliberately shared across every
+   * element in this selector, not scoped to whichever one is currently
+   * open. That's what makes editing element A then element B land as ONE
+   * image with both edits: B's edit is generated starting from A's result,
+   * not from the untouched original frame, so A's change is still there
+   * (outside B's own mask) once B's edit comes back. See `sessionImageUrl`'s
+   * own doc comment and buildCombinedPrompt in lib/promptCombiner.ts, which
+   * is what actually hands this single composite to Mic Studio as the
+   * combined reference image instead of one image per element.
+   *
    * Nothing is written onto the element itself until Save — this only
-   * updates the thread (`draftMessages`) and `lastGeneratedUrl`, so Cancel
-   * still discards everything cleanly, same as before this call existed.
+   * updates the thread (`draftMessages`), `lastGeneratedUrl`, and
+   * `sessionImageUrl`, so Cancel still discards everything cleanly, same as
+   * before this call existed (sessionImageUrl is only ever read at Done/
+   * finalize time, never persisted until then).
    */
   async function sendComposedMessage() {
     const text = composeText.trim();
     if (!text || generating || !editingElement || !frameUrl) return;
+
+    const priorInstructions = draftMessages
+      .filter(
+        (m): m is Extract<EditorMessage, { role: "user" }> =>
+          m.role === "user",
+      )
+      .map((m) => m.text);
+    const combinedPrompt = [...priorInstructions, text].join("\n\n");
 
     messageSeq.current += 1;
     const userMessage: EditorMessage = {
@@ -726,9 +790,9 @@ export default function SceneObjectSelector({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          imageUrl: frameUrl,
+          imageUrl: sessionImageUrl ?? frameUrl,
           maskUrl: editingElement.maskUrl,
-          prompt: text,
+          prompt: combinedPrompt,
         }),
       });
       const json = (await res.json()) as {
@@ -750,6 +814,7 @@ export default function SceneObjectSelector({
         },
       ]);
       setLastGeneratedUrl(json.url);
+      setSessionImageUrl(json.url);
     } catch (e) {
       setEditorError(
         e instanceof Error ? e.message : "Could not generate that edit.",
@@ -924,7 +989,11 @@ export default function SceneObjectSelector({
       onClose();
       return;
     }
-    const dataset2 = buildCombinedPrompt(list);
+    // sessionImageUrl is the one running composite every Send this session
+    // built onto — see its own doc comment — so it's what buildCombinedPrompt
+    // uses as the single combined reference image when anything was actually
+    // AI-edited this session, instead of folding each element in separately.
+    const dataset2 = buildCombinedPrompt(list, sessionImageUrl);
     onSave({
       prompt: dataset2.combinedPrompt,
       referenceImageUrls: dataset2.attachments.map((a) => a.url),
@@ -1624,13 +1693,15 @@ export default function SceneObjectSelector({
                 </div>
                 <p className="-mt-1.5 text-[10px] text-ink-500">
                   Enter to send, Shift+Enter for a new line. Send actually
-                  generates this element&apos;s edited frame — everything
-                  outside the highlight stays untouched, and the result
-                  (labeled Mock if mock mode is on) becomes what reaches Mic
-                  Studio for this element. ↻ instead moves the highlighted
-                  area itself, without generating anything. 📎 attaches extra
-                  reference images, described in your own words for now
-                  rather than sent to the model directly.
+                  generates this edit — everything outside the highlight
+                  stays untouched, and it builds on top of any other
+                  element you&apos;ve already edited here, so editing
+                  several elements lands as one combined image (labeled
+                  Mock if mock mode is on), not a separate image per
+                  element. ↻ instead moves the highlighted area itself,
+                  without generating anything. 📎 attaches extra reference
+                  images, described in your own words for now rather than
+                  sent to the model directly.
                 </p>
 
                 {editorError && (
