@@ -796,11 +796,41 @@ function ReferenceEditorInner() {
     const unordered: Contribution[] = [];
 
     if (clip.clipEdit) {
-      ordered.push({
-        seq: clip.clipEdit.seq,
-        imageUrls: clip.clipEdit.imageUrls,
-        prompt: clip.clipEdit.prompt,
-      });
+      if (clip.clipEdit.imageUrls.length > 0) {
+        ordered.push({
+          seq: clip.clipEdit.seq,
+          imageUrls: clip.clipEdit.imageUrls,
+          prompt: clip.clipEdit.prompt,
+        });
+      } else {
+        // Same empty-attachments gap fixed for snaps below, one level up:
+        // the clip's own "Select objects" selector was saved with a typed
+        // instruction but no attached/generated image, so clipEdit.imageUrls
+        // is empty — this clip would otherwise vanish from the hand-off
+        // (or, if it's the only included clip, leave Studio with zero
+        // images entirely, which is the "sometimes landed without assets"
+        // report even after the snap-level fix). Falls back to the clip's
+        // own already-captured preview thumbnail, uploaded fresh, the same
+        // way an un-merged snap falls back to its raw frame.
+        let fallbackUrl: string | null = null;
+        if (clip.thumbnail) {
+          try {
+            const blob = await (await fetch(clip.thumbnail)).blob();
+            const file = new File([blob], `${clip.job.id}-clip.jpg`, {
+              type: "image/jpeg",
+            });
+            fallbackUrl = await uploadMedia(file, "image", granted);
+          } catch {
+            // Best-effort — fall through to a prompt-only contribution
+            // below rather than blocking the hand-off.
+          }
+        }
+        ordered.push({
+          seq: clip.clipEdit.seq,
+          imageUrls: fallbackUrl ? [fallbackUrl] : [],
+          prompt: clip.clipEdit.prompt,
+        });
+      }
     }
 
     for (const s of clip.snaps) {
