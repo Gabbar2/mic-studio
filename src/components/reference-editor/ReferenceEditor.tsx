@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import FlashOnView from "../FlashOnView";
 import TrimTimeline from "./TrimTimeline";
+import SceneSnapTaker from "./SceneSnapTaker";
 import SceneObjectSelector from "./SceneObjectSelector";
 import ConsentCheckbox, {
   UploadConsentProvider,
@@ -216,6 +217,11 @@ function ReferenceEditorInner() {
   // order the user actually committed these edits in" later, since nothing
   // else records that (two saves a minute apart look identical otherwise).
   const editSeq = useRef(0);
+  // Guards the auto-trigger effect below so scene detection fires exactly
+  // once per loaded source, the moment consent is granted — not on every
+  // re-render afterward. Reset to false by loadSource whenever a fresh
+  // source comes in (see there).
+  const autoPreparedRef = useRef(false);
 
   const [stage, setStage] = useState<Stage>("empty");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -318,6 +324,10 @@ function ReferenceEditorInner() {
     setIncluded({});
     setStage("empty");
     setSourceFile(file);
+    // A fresh source means detection hasn't auto-run for it yet — see the
+    // auto-trigger effect below, which this flag guards against re-firing
+    // on every re-render once it has.
+    autoPreparedRef.current = false;
 
     const objectUrl = file ? URL.createObjectURL(file) : remoteUrl;
     setSourceUrl(objectUrl);
@@ -576,6 +586,35 @@ function ReferenceEditorInner() {
     }
   }
 
+  // Replaces the old manual "Prepare clip(s)" button: scene detection now
+  // runs automatically, exactly once per loaded source, the moment the
+  // consent checkbox is checked — chosen (over firing as soon as the trim
+  // range settles) so real work never starts before the person has
+  // explicitly agreed to the upload-rights statement. autoPreparedRef makes
+  // this fire-once: granted can flip true/false/true again (the checkbox
+  // itself doesn't lock), but detection should never re-run just because of
+  // that — only a genuinely new source (loadSource resets the ref) gets a
+  // fresh auto-run.
+  useEffect(() => {
+    if (
+      granted &&
+      !autoPreparedRef.current &&
+      stage === "loaded" &&
+      model &&
+      meta &&
+      sourceUrl
+    ) {
+      autoPreparedRef.current = true;
+      void handlePrepare();
+    }
+    // handlePrepare intentionally omitted — it closes over state that
+    // changes every render (clips, range, etc.), and re-running this effect
+    // for those would defeat the whole point of autoPreparedRef gating a
+    // single fire. Every value this effect actually needs to decide
+    // whether to fire is listed below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [granted, stage, model, meta, sourceUrl]);
+
   const selectedJobs = clips
     .filter((c) => included[c.job.id] !== false)
     .map((c) => c.job);
@@ -634,20 +673,19 @@ function ReferenceEditorInner() {
   }
 
   /**
-   * "Take Snap" on the trim timeline hands back a freshly captured JPEG
-   * data URL — this turns it into a SnapRecord and attaches it to whichever
-   * clip was prepared most recently (clips[clips.length - 1]), since that's
-   * "the selected clip" in the normal one-clip-at-a-time flow this was
-   * built for; TrimTimeline itself only offers the button once clips.length
-   * > 0 (see canTakeSnap below), so this should never fire with an empty
-   * list, but the guard is cheap insurance against the button briefly being
-   * stale mid-render. Decoding the data URL here (rather than asking
-   * TrimTimeline for pixel dimensions) means TrimTimeline doesn't need to
-   * know anything about SceneObjectSelector's frameWidth/frameHeight needs.
+   * A scene tile's own SceneSnapTaker hands back a freshly captured JPEG
+   * data URL plus the clip it was taken for — this turns it into a
+   * SnapRecord and attaches it to that exact clip. Previously this always
+   * targeted "whichever clip was prepared most recently" (the single
+   * global TrimTimeline's snap control, built for a one-clip-at-a-time
+   * flow); now that every scene is detected and available at once (see the
+   * auto-trigger effect above) and each scene tile has its own snap-taker,
+   * there's no single "most recent" clip to default to — the caller always
+   * says which one. Decoding the data URL here (rather than asking the
+   * caller for pixel dimensions) means SceneSnapTaker doesn't need to know
+   * anything about SceneObjectSelector's frameWidth/frameHeight needs.
    */
-  function handleTakeSnap(dataUrl: string, atSeconds: number) {
-    if (clips.length === 0) return;
-    const targetClipId = clips[clips.length - 1].job.id;
+  function handleTakeSnap(clipId: string, dataUrl: string, atSeconds: number) {
     const img = new Image();
     img.onload = () => {
       snapSeq.current += 1;
@@ -665,25 +703,19 @@ function ReferenceEditorInner() {
       };
       setClips((prev) =>
         prev.map((c) =>
-          c.job.id === targetClipId ? { ...c, snaps: [...c.snaps, snap] } : c,
+          c.job.id === clipId ? { ...c, snaps: [...c.snaps, snap] } : c,
         ),
       );
     };
     img.src = dataUrl;
   }
 
-  // Whichever clip "Take Snap" attaches new snaps to, and the trim handles
-  // lock against once it exists — always the most recently prepared one,
-  // matching the normal one-clip-at-a-time flow this was built for. Once a
-  // clip has been prepared, the trim range stays locked for good: this app
-  // doesn't offer a way to unlock it again (see TrimTimeline — no "adjust
-  // range" control), so a later clip's own range always comes from a fresh
-  // trim before its own Prepare run, not a reopened one.
-  const activeClip = clips.length > 0 ? clips[clips.length - 1] : null;
+  // The trim range's handles lock for good the moment at least one clip
+  // exists — this app doesn't offer a way to unlock it again (see
+  // TrimTimeline — no "adjust range" control): detection has already run
+  // against whatever range was selected, so a different range now would
+  // need its own fresh detection run, which this flow doesn't support.
   const trimLocked = clips.length > 0;
-  const activeClipSnapSeconds = activeClip
-    ? activeClip.snaps.map((s) => s.atSeconds)
-    : [];
 
   const selectorSnapClip = selectorSnap
     ? (clips.find((c) => c.job.id === selectorSnap.clipId) ?? null)
@@ -1045,6 +1077,82 @@ function ReferenceEditorInner() {
     }
   }
 
+  /**
+   * One scene's own row of snap thumbnails — factored out since it's now
+   * rendered inside every scene tile (one clip can have its own snaps,
+   * independent of any other clip's), not in one shared global section tied
+   * to "whichever clip was prepared most recently" the way it used to be.
+   */
+  function renderSnapRow(clip: PreparedClip) {
+    if (clip.snaps.length === 0) return null;
+    return (
+      <div
+        className="flex flex-wrap gap-2 border-t border-ink-650 bg-ink-900 p-2"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {clip.snaps.map((s) => {
+          const isIncluded = snapIncluded[s.id] !== false;
+          const preview = snapPreviewUrl(s);
+          const downloading = downloadingId === s.id;
+          return (
+            <div
+              key={s.id}
+              className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-lg border transition ${
+                isIncluded
+                  ? "border-ink-650 hover:border-accent-400"
+                  : "border-ink-650 opacity-40"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() =>
+                  setSelectorSnap({ clipId: clip.job.id, snapId: s.id })
+                }
+                title={
+                  s.elements.some((el) => el.status === "completed")
+                    ? "Snap — selections set, edit →"
+                    : "Snap — select objects →"
+                }
+                className="absolute inset-0 h-full w-full"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={preview} alt="" className="h-full w-full object-cover" />
+                {s.elements.some((el) => el.status === "completed") && (
+                  <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
+                )}
+              </button>
+              <input
+                type="checkbox"
+                checked={isIncluded}
+                title="Include this snap in the hand-off to Mic Studio"
+                onChange={(e) =>
+                  setSnapIncluded((prev) => ({
+                    ...prev,
+                    [s.id]: e.target.checked,
+                  }))
+                }
+                className="absolute left-1 top-1 z-10 h-3.5 w-3.5 accent-accent-500"
+              />
+              <button
+                type="button"
+                disabled={downloading}
+                title="Download this snap as an image"
+                aria-label="Download this snap as an image"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleThumbnailDownload(s.id, preview, `${s.id}.jpg`);
+                }}
+                className="absolute bottom-1 left-1 z-10 flex h-4 w-4 items-center justify-center rounded bg-black/70 text-[10px] text-white hover:bg-black disabled:opacity-60"
+              >
+                {downloading ? "…" : "↓"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-3xl space-y-6 px-4 py-8 sm:px-6">
       <div>
@@ -1364,34 +1472,33 @@ function ReferenceEditorInner() {
             end={range.end}
             onRangeChange={(start, end) => setRange({ start, end })}
             capSeconds={capSeconds}
-            canTakeSnap={clips.length > 0}
-            onTakeSnap={handleTakeSnap}
-            snapMarkers={activeClipSnapSeconds}
             locked={trimLocked}
           />
 
           {/* --- Prepare -------------------------------------------------- */}
+          {/* No button here anymore — checking the consent box below is
+              what starts scene detection (see the auto-trigger effect
+              above), running automatically rather than needing a separate
+              "Prepare clip(s)" click. */}
           <div className="space-y-2.5">
             <ConsentCheckbox />
-            <button
-              type="button"
-              onClick={() => void handlePrepare()}
-              disabled={stage === "preparing" || !granted}
-              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
-            >
-              {stage === "preparing"
-                ? `${prepareLabel} ${Math.round(prepareProgress * 100)}%`
-                : "Prepare clip(s)"}
-            </button>
-            <FlashOnView>
-              <p className="text-center text-[11px] text-ink-400">
-                This finds scene cuts inside your selection, trims each one
-                into its own reference clip, right here in the browser — no
-                file leaves your device until each clip is uploaded. The
-                first clip may take a little longer while the trimming
-                engine itself downloads.
-              </p>
-            </FlashOnView>
+            {!granted && stage === "loaded" && (
+              <FlashOnView>
+                <p className="text-center text-[11px] text-ink-400">
+                  Check the box above once you&apos;re happy with the
+                  trimmed range — scene detection starts automatically from
+                  there, right here in your browser: no file leaves your
+                  device until each scene's clip is uploaded. The first
+                  scene may take a little longer while the trimming engine
+                  itself downloads.
+                </p>
+              </FlashOnView>
+            )}
+            {stage === "preparing" && (
+              <div className="rounded-xl border border-accent-500/40 bg-accent-500/10 px-4 py-3 text-center text-sm font-medium text-accent-300">
+                {prepareLabel} {Math.round(prepareProgress * 100)}%
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1400,112 +1507,6 @@ function ReferenceEditorInner() {
         <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </p>
-      )}
-
-      {/* --- Snaps ------------------------------------------------------- */}
-      {/* Its own section, separate from the "Clip ready" tiles below — a
-          snap isn't a scene, it's an extra still pulled from whichever clip
-          was prepared most recently (activeClip). Whatever gets edited on
-          one still folds onto that clip's own prompt/image references when
-          saved (saveSnapPrompt), it's just not nested inside that clip's
-          tile visually. */}
-      {activeClip && activeClip.snaps.length > 0 && (
-        <div className="space-y-2 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
-          <h2 className="text-sm font-semibold text-white">📍 Snaps</h2>
-          <p className="text-[11px] text-ink-400">
-            Extra frames grabbed from the trim timeline above. Tap one to
-            select objects on it — whatever you save there is added onto the
-            clip&apos;s own image references below. Uncheck a snap to leave
-            it out of the hand-off entirely.
-          </p>
-          {/* The order-matters hint — first thing a person sees once a
-              second potential contribution (a snap, alongside the clip's
-              own "Select objects") exists at all, which is exactly the
-              moment picking an edit order starts to matter. Flashes once on
-              first view (FlashOnView) since it's easy to skim past
-              otherwise, and stays concrete rather than abstract: it names
-              the actual mechanism (Image 1, Image 2, ...) instead of just
-              saying "order matters". */}
-          <FlashOnView>
-            <p className="rounded-md border border-accent-500/30 bg-accent-500/[0.08] px-2.5 py-1.5 text-[11px] leading-snug text-accent-400">
-              Save order matters: whichever snap or selection you save
-              first becomes Image 1 in Mic Studio, the next becomes Image 2,
-              and so on — not the order these tiles are laid out in.
-            </p>
-          </FlashOnView>
-          <div className="flex flex-wrap gap-2">
-            {activeClip.snaps.map((s) => {
-              const isIncluded = snapIncluded[s.id] !== false;
-              const preview = snapPreviewUrl(s);
-              const downloading = downloadingId === s.id;
-              return (
-                <div
-                  key={s.id}
-                  className={`relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border transition ${
-                    isIncluded
-                      ? "border-ink-650 hover:border-accent-400"
-                      : "border-ink-650 opacity-40"
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSelectorSnap({
-                        clipId: activeClip.job.id,
-                        snapId: s.id,
-                      })
-                    }
-                    title={
-                      s.elements.some((el) => el.status === "completed")
-                        ? "Snap — selections set, edit →"
-                        : "Snap — select objects →"
-                    }
-                    className="absolute inset-0 h-full w-full"
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={preview}
-                      alt=""
-                      className="h-full w-full object-cover"
-                    />
-                    {s.elements.some((el) => el.status === "completed") && (
-                      <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
-                    )}
-                  </button>
-                  <input
-                    type="checkbox"
-                    checked={isIncluded}
-                    title="Include this snap in the hand-off to Mic Studio"
-                    onChange={(e) =>
-                      setSnapIncluded((prev) => ({
-                        ...prev,
-                        [s.id]: e.target.checked,
-                      }))
-                    }
-                    className="absolute left-1 top-1 z-10 h-3.5 w-3.5 accent-accent-500"
-                  />
-                  <button
-                    type="button"
-                    disabled={downloading}
-                    title="Download this snap as an image"
-                    aria-label="Download this snap as an image"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void handleThumbnailDownload(
-                        s.id,
-                        preview,
-                        `${s.id}.jpg`,
-                      );
-                    }}
-                    className="absolute bottom-1 left-1 z-10 flex h-4 w-4 items-center justify-center rounded bg-black/70 text-[10px] text-white hover:bg-black disabled:opacity-60"
-                  >
-                    {downloading ? "…" : "↓"}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
       )}
 
       {/* --- Detected scenes + transfer -------------------------------------- */}
@@ -1546,7 +1547,24 @@ function ReferenceEditorInner() {
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {/* Stacked, full-width cards rather than a tight grid — each
+                scene tile now carries its own snap-taking scrubber (see
+                SceneSnapTaker below), which needs real width to be usable,
+                and with detection running automatically for every scene at
+                once (see the auto-trigger effect above) there's no longer a
+                "just glance at the thumbnails" grid use case this was
+                originally sized for. */}
+            {clips.length > 1 && (
+              <FlashOnView>
+                <p className="rounded-md border border-accent-500/30 bg-accent-500/[0.08] px-2.5 py-1.5 text-[11px] leading-snug text-accent-400">
+                  Save order matters: whichever scene or snap you save a
+                  selection for first becomes Image 1 in Mic Studio, the
+                  next becomes Image 2, and so on — not the order these
+                  cards are laid out in.
+                </p>
+              </FlashOnView>
+            )}
+            <div className="flex flex-col gap-3">
               {clips.map((c, i) => {
                 const isIncluded = included[c.job.id] !== false;
                 return (
@@ -1677,6 +1695,21 @@ function ReferenceEditorInner() {
                       placeholder="Headline for this beat (optional)"
                       className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-[10px] text-ink-200 placeholder:text-ink-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
                     />
+                    {/* This scene's own snap-taking control — scoped to
+                        just this clip's [start, end] span (see
+                        SceneSnapTaker's own doc comment for why this
+                        replaced the old single global snap-taker). */}
+                    <div className="border-t border-ink-650 p-2">
+                      <SceneSnapTaker
+                        sourceUrl={sourceUrl}
+                        start={c.start}
+                        end={c.end}
+                        onTakeSnap={(dataUrl, atSeconds) =>
+                          handleTakeSnap(c.job.id, dataUrl, atSeconds)
+                        }
+                      />
+                    </div>
+                    {renderSnapRow(c)}
                   </label>
                 );
               })}
