@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import FlashOnView from "../FlashOnView";
 import TrimTimeline from "./TrimTimeline";
-import SceneSnapTaker from "./SceneSnapTaker";
 import SceneObjectSelector from "./SceneObjectSelector";
 import ConsentCheckbox, {
   UploadConsentProvider,
@@ -222,6 +221,24 @@ function ReferenceEditorInner() {
   // re-render afterward. Reset to false by loadSource whenever a fresh
   // source comes in (see there).
   const autoPreparedRef = useRef(false);
+  // Uploaded URL per snap id, so building the hand-off twice (once for
+  // "Generate prompt", again on Continue) doesn't upload the same raw
+  // snapshot twice.
+  const snapUploadCache = useRef<Map<string, string>>(new Map());
+
+  // Scene-splitting controls (the "Clip length" panel). `lengthPreset`
+  // drives `maxSeconds`: picking 3s/5s fills the field, "custom" lets the
+  // person type any value. Min is the shortest scene kept before it merges
+  // into a neighbour — 1s by default, since sub-second clips are what the
+  // video models reject outright.
+  const [lengthPreset, setLengthPreset] = useState<"3" | "5" | "custom">(
+    "custom",
+  );
+  const [maxSeconds, setMaxSeconds] = useState<number | null>(null);
+  const [minSeconds, setMinSeconds] = useState(1);
+  // The final prompt shown (and editable) before hand-off.
+  const [finalPrompt, setFinalPrompt] = useState("");
+  const [generatingPrompt, setGeneratingPrompt] = useState(false);
 
   const [stage, setStage] = useState<Stage>("empty");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -317,6 +334,8 @@ function ReferenceEditorInner() {
 
   const model = getModel(modelId) ?? REFERENCE_MODELS[0];
   const capSeconds = model ? referenceVideoCapSeconds(model) : 0;
+  // Blank "Max" means "as long as the model allows".
+  const effectiveMax = maxSeconds && maxSeconds > 0 ? maxSeconds : capSeconds || Infinity;
 
   const loadSource = useCallback((file: File | null, remoteUrl: string) => {
     setError(null);
@@ -427,7 +446,7 @@ function ReferenceEditorInner() {
     setMediaInputMode("buttons");
   }
 
-  async function handlePrepare() {
+  async function handlePrepare(replace = false) {
     if (!model || !meta || !sourceUrl) return;
     if (!granted) {
       setError("Tick the confirmation above first.");
@@ -443,6 +462,12 @@ function ReferenceEditorInner() {
     // everything, since that's swapping the source entirely.
     setStage("preparing");
     setError(null);
+    if (replace) {
+      setClips([]);
+      setIncluded({});
+      setSnapIncluded({});
+      setFinalPrompt("");
+    }
     // Tracked separately from the `clips` state (which this closure can
     // only see as of the render that started this run) so the catch below
     // knows whether THIS run added anything before failing, even if
@@ -495,7 +520,8 @@ function ReferenceEditorInner() {
         cuts,
         range.start,
         range.end,
-        capSeconds || Infinity,
+        Math.min(effectiveMax, capSeconds || Infinity),
+        Math.max(0.2, minSeconds),
       );
       const aspectRatio = guessAspectRatio(meta.width, meta.height);
 
@@ -540,10 +566,35 @@ function ReferenceEditorInner() {
 
         // Best-effort — a missing thumbnail just renders an empty tile
         // rather than failing the whole prepare flow (see videoThumbnail.ts).
-        const thumbnail = await captureThumbnail(
-          sourceUrl,
-          (seg.start + seg.end) / 2,
-        );
+        const midpoint = (seg.start + seg.end) / 2;
+        const thumbnail = await captureThumbnail(sourceUrl, midpoint);
+        // Every scene automatically gets ONE snapshot — its own midpoint
+        // frame — instead of the person having to grab one by hand. It is
+        // a normal SnapRecord, so tapping it opens the same "Select objects"
+        // editor, and its checkbox decides whether it goes to Mic Studio.
+        let autoSnap: SnapRecord | null = null;
+        if (thumbnail) {
+          const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+            const im = new Image();
+            im.onload = () =>
+              resolve({ w: im.naturalWidth || 960, h: im.naturalHeight || 540 });
+            im.onerror = () => resolve({ w: 960, h: 540 });
+            im.src = thumbnail;
+          });
+          snapSeq.current += 1;
+          autoSnap = {
+            id: `snap-${snapSeq.current}`,
+            atSeconds: midpoint,
+            frameDataUrl: thumbnail,
+            frameWidth: dims.w,
+            frameHeight: dims.h,
+            elements: [],
+            mergedIntoClip: false,
+            seq: null,
+            editedImageUrls: [],
+            editedPrompt: "",
+          };
+        }
 
         // Appended onto whatever was already prepared — not replaced — so
         // running this again after an earlier run keeps those clips. Shown
@@ -559,7 +610,7 @@ function ReferenceEditorInner() {
             end: seg.end,
             thumbnail,
             elements: [],
-            snaps: [],
+            snaps: autoSnap ? [autoSnap] : [],
             headline: "",
             clipEdit: null,
           },
@@ -582,7 +633,7 @@ function ReferenceEditorInner() {
       // itself managed to add before hitting the error — so a failure
       // partway through a second run doesn't hide clips already reviewed
       // and kept.
-      setStage(clips.length > 0 || addedThisRun > 0 ? "ready" : "loaded");
+      setStage((!replace && clips.length > 0) || addedThisRun > 0 ? "ready" : "loaded");
     }
   }
 
@@ -670,44 +721,6 @@ function ReferenceEditorInner() {
     setClips((prev) =>
       prev.map((c) => (c.job.id === clipId ? { ...c, headline } : c)),
     );
-  }
-
-  /**
-   * A scene tile's own SceneSnapTaker hands back a freshly captured JPEG
-   * data URL plus the clip it was taken for — this turns it into a
-   * SnapRecord and attaches it to that exact clip. Previously this always
-   * targeted "whichever clip was prepared most recently" (the single
-   * global TrimTimeline's snap control, built for a one-clip-at-a-time
-   * flow); now that every scene is detected and available at once (see the
-   * auto-trigger effect above) and each scene tile has its own snap-taker,
-   * there's no single "most recent" clip to default to — the caller always
-   * says which one. Decoding the data URL here (rather than asking the
-   * caller for pixel dimensions) means SceneSnapTaker doesn't need to know
-   * anything about SceneObjectSelector's frameWidth/frameHeight needs.
-   */
-  function handleTakeSnap(clipId: string, dataUrl: string, atSeconds: number) {
-    const img = new Image();
-    img.onload = () => {
-      snapSeq.current += 1;
-      const snap: SnapRecord = {
-        id: `snap-${snapSeq.current}`,
-        atSeconds,
-        frameDataUrl: dataUrl,
-        frameWidth: img.naturalWidth || 960,
-        frameHeight: img.naturalHeight || 540,
-        elements: [],
-        mergedIntoClip: false,
-        seq: null,
-        editedImageUrls: [],
-        editedPrompt: "",
-      };
-      setClips((prev) =>
-        prev.map((c) =>
-          c.job.id === clipId ? { ...c, snaps: [...c.snaps, snap] } : c,
-        ),
-      );
-    };
-    img.src = dataUrl;
   }
 
   // The trim range's handles lock for good the moment at least one clip
@@ -881,9 +894,13 @@ function ReferenceEditorInner() {
       // (same path a clip's own trimmed video goes through) rather than
       // contributing nothing.
       try {
-        const blob = await (await fetch(s.frameDataUrl)).blob();
-        const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
-        const url = await uploadMedia(file, "image", granted);
+        let url = snapUploadCache.current.get(s.id);
+        if (!url) {
+          const blob = await (await fetch(s.frameDataUrl)).blob();
+          const file = new File([blob], `${s.id}.jpg`, { type: "image/jpeg" });
+          url = await uploadMedia(file, "image", granted);
+          snapUploadCache.current.set(s.id, url);
+        }
         if (s.mergedIntoClip && s.seq != null) {
           // Saved with a real instruction, just no image of its own — keep
           // its place in the sequence and its prompt text.
@@ -959,93 +976,108 @@ function ReferenceEditorInner() {
    * straight back to the old plain concatenation, so a broken or
    * unconfigured prompt-writer never blocks getting to Studio at all.
    */
+  /**
+   * Builds everything the hand-off needs from the CHECKED scenes/snaps, in
+   * scene order: the per-clip jobs, the first clip (whose video leads), and
+   * the ordered image list — each image is one beat in the final prompt.
+   */
+  async function assembleHandoff() {
+    const includedClips = clips.filter((c) => included[c.job.id] !== false);
+    const perClipJobs = await Promise.all(
+      includedClips.map(async (c) => {
+        const built = await buildCombinedReferences(c);
+        return {
+          ...c.job,
+          referenceImageUrls: built.imageUrls,
+          prompt: built.prompt,
+        };
+      }),
+    );
+    const [firstJob] = perClipJobs;
+    // Only one video reference can ever be attached, so the first checked
+    // scene's video is the one that reaches Studio; the rest contribute
+    // their snapshot images and prompt text only.
+    const beats = perClipJobs.flatMap((j, clipIndex) =>
+      j.referenceImageUrls.map((imageUrl, imageIndex) => ({
+        imageUrl,
+        headline:
+          imageIndex === 0
+            ? includedClips[clipIndex]?.headline.trim() || null
+            : null,
+      })),
+    );
+    const trimmedBeats = beats.slice(0, model.maxReferences);
+    const fallbackPrompt = perClipJobs
+      .map((j) => j.prompt.trim())
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+    return {
+      firstJob,
+      trimmedBeats,
+      combinedImageUrls: trimmedBeats.map((b) => b.imageUrl),
+      fallbackPrompt,
+    };
+  }
+
+  /** Asks /api/compose-prompt to write the prompt from the ordered beats,
+   * falling back to the typed instructions if that call fails. Always capped
+   * to the model's prompt limit. */
+  async function composePromptFor(
+    h: Awaited<ReturnType<typeof assembleHandoff>>,
+  ): Promise<string> {
+    let prompt = h.fallbackPrompt;
+    if (h.trimmedBeats.length > 0) {
+      try {
+        const motionFrameDataUrls = await sampleMotionFrames(h.firstJob);
+        const res = await fetch("/api/compose-prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            aspectRatio: h.firstJob.aspectRatio,
+            motionFrameDataUrls,
+            beats: h.trimmedBeats,
+            maxChars: model.maxPromptChars,
+          }),
+        });
+        const json = (await res.json().catch(() => null)) as {
+          prompt?: string;
+        } | null;
+        if (res.ok && json?.prompt?.trim()) prompt = json.prompt.trim();
+      } catch {
+        // Best-effort — the typed-instruction fallback carries on.
+      }
+    }
+    return prompt.length > model.maxPromptChars
+      ? truncateToChars(prompt, model.maxPromptChars)
+      : prompt;
+  }
+
+  /** The "Generate prompt" button: writes the final prompt from the checked
+   * snapshots, in order, into the editable field below them. */
+  async function generatePrompt() {
+    if (selectedJobs.length === 0 || generatingPrompt) return;
+    setGeneratingPrompt(true);
+    setError(null);
+    try {
+      const h = await assembleHandoff();
+      setFinalPrompt(await composePromptFor(h));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not generate a prompt.");
+    } finally {
+      setGeneratingPrompt(false);
+    }
+  }
+
   async function continueInStudio() {
     if (selectedJobs.length === 0 || navigatingToStudio) return;
     setNavigatingToStudio(true);
     setError(null);
     try {
-      const includedClips = clips.filter((c) => included[c.job.id] !== false);
-      const perClipJobs = await Promise.all(
-        includedClips.map(async (c) => {
-          const built = await buildCombinedReferences(c);
-          return {
-            ...c.job,
-            referenceImageUrls: built.imageUrls,
-            prompt: built.prompt,
-          };
-        }),
-      );
-
-      const [firstJob, ...restJobs] = perClipJobs;
-      // restJobs' own videos are deliberately dropped — only one video
-      // reference can ever be attached, so the first included clip's video
-      // is the one that reaches Studio; the rest contribute images and
-      // prompt text only. Named here (rather than left implicit) so a
-      // future "which clip's video should lead?" picker has an obvious
-      // place to plug in instead of this always silently picking "first".
-      void restJobs;
-
-      // One entry per image in the final combined list, in order — the
-      // first image contributed by each clip carries that clip's own typed
-      // headline (if any); any further images from the same clip (extra
-      // elements, extra snaps) carry no headline of their own, since the
-      // beat they belong to already got one.
-      const beats = perClipJobs.flatMap((j, clipIndex) =>
-        j.referenceImageUrls.map((imageUrl, imageIndex) => ({
-          imageUrl,
-          headline:
-            imageIndex === 0
-              ? includedClips[clipIndex]?.headline.trim() || null
-              : null,
-        })),
-      );
-      const trimmedBeats = beats.slice(0, model.maxReferences);
-      const combinedImageUrls = trimmedBeats.map((b) => b.imageUrl);
-
-      const fallbackPrompt = perClipJobs
-        .map((j) => j.prompt.trim())
-        .filter((t) => t.length > 0)
-        .join("\n\n");
-
-      let prompt = fallbackPrompt;
-      if (trimmedBeats.length > 0) {
-        try {
-          const motionFrameDataUrls = await sampleMotionFrames(firstJob);
-          const res = await fetch("/api/compose-prompt", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              aspectRatio: firstJob.aspectRatio,
-              motionFrameDataUrls,
-              beats: trimmedBeats,
-              // The model this hand-off is actually loading Studio into —
-              // its own field cap is what the composed prompt has to fit,
-              // not some other model's. See promptWriter.ts's doc comment:
-              // this is the fix for a real, correct prompt that simply ran
-              // long (2746 chars against this model's 2000-char field).
-              maxChars: model.maxPromptChars,
-            }),
-          });
-          const json = (await res.json().catch(() => null)) as {
-            prompt?: string;
-          } | null;
-          if (res.ok && json?.prompt?.trim()) {
-            prompt = json.prompt.trim();
-          }
-        } catch {
-          // Best-effort — fallbackPrompt (already computed above) carries
-          // this hand-off the rest of the way; see this function's own doc
-          // comment for why a broken prompt-writer must never block
-          // reaching Studio.
-        }
-      }
-
-      // Defensive cap, independent of whether /api/compose-prompt ran at
-      // all: the plain-concatenation fallback (every clip/snap's own typed
-      // instruction, joined) has no length awareness of its own either, and
-      // is exactly what ships when OPENAI_API_KEY isn't configured or the
-      // call above failed outright — so it needs the same ceiling applied
-      // here rather than trusting either path to have already respected it.
+      const h = await assembleHandoff();
+      const { firstJob, combinedImageUrls } = h;
+      // Use the prompt on screen when there is one (the person may have
+      // edited it); otherwise write one now.
+      let prompt = finalPrompt.trim() || (await composePromptFor(h));
       if (prompt.length > model.maxPromptChars) {
         prompt = truncateToChars(prompt, model.maxPromptChars);
       }
@@ -1075,82 +1107,6 @@ function ReferenceEditorInner() {
       );
       setNavigatingToStudio(false);
     }
-  }
-
-  /**
-   * One scene's own row of snap thumbnails — factored out since it's now
-   * rendered inside every scene tile (one clip can have its own snaps,
-   * independent of any other clip's), not in one shared global section tied
-   * to "whichever clip was prepared most recently" the way it used to be.
-   */
-  function renderSnapRow(clip: PreparedClip) {
-    if (clip.snaps.length === 0) return null;
-    return (
-      <div
-        className="flex flex-wrap gap-2 border-t border-ink-650 bg-ink-900 p-2"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {clip.snaps.map((s) => {
-          const isIncluded = snapIncluded[s.id] !== false;
-          const preview = snapPreviewUrl(s);
-          const downloading = downloadingId === s.id;
-          return (
-            <div
-              key={s.id}
-              className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-lg border transition ${
-                isIncluded
-                  ? "border-ink-650 hover:border-accent-400"
-                  : "border-ink-650 opacity-40"
-              }`}
-            >
-              <button
-                type="button"
-                onClick={() =>
-                  setSelectorSnap({ clipId: clip.job.id, snapId: s.id })
-                }
-                title={
-                  s.elements.some((el) => el.status === "completed")
-                    ? "Snap — selections set, edit →"
-                    : "Snap — select objects →"
-                }
-                className="absolute inset-0 h-full w-full"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={preview} alt="" className="h-full w-full object-cover" />
-                {s.elements.some((el) => el.status === "completed") && (
-                  <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
-                )}
-              </button>
-              <input
-                type="checkbox"
-                checked={isIncluded}
-                title="Include this snap in the hand-off to Mic Studio"
-                onChange={(e) =>
-                  setSnapIncluded((prev) => ({
-                    ...prev,
-                    [s.id]: e.target.checked,
-                  }))
-                }
-                className="absolute left-1 top-1 z-10 h-3.5 w-3.5 accent-accent-500"
-              />
-              <button
-                type="button"
-                disabled={downloading}
-                title="Download this snap as an image"
-                aria-label="Download this snap as an image"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void handleThumbnailDownload(s.id, preview, `${s.id}.jpg`);
-                }}
-                className="absolute bottom-1 left-1 z-10 flex h-4 w-4 items-center justify-center rounded bg-black/70 text-[10px] text-white hover:bg-black disabled:opacity-60"
-              >
-                {downloading ? "…" : "↓"}
-              </button>
-            </div>
-          );
-        })}
-      </div>
-    );
   }
 
   return (
@@ -1481,6 +1437,67 @@ function ReferenceEditorInner() {
               above), running automatically rather than needing a separate
               "Prepare clip(s)" click. */}
           <div className="space-y-2.5">
+            {/* Scene-splitting controls — how long each scene may run and
+                how short one may be before it merges into its neighbour.
+                Re-run redoes detection with these values and replaces the
+                scenes/snapshots below. */}
+            <div className="rounded-lg border border-ink-650 bg-ink-850 p-3">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <label className="text-[10px] uppercase tracking-wide text-ink-400">
+                  Clip length (max)
+                  <select
+                    value={lengthPreset}
+                    onChange={(e) => {
+                      const v = e.target.value as "3" | "5" | "custom";
+                      setLengthPreset(v);
+                      if (v !== "custom") setMaxSeconds(Number(v));
+                    }}
+                    className="mt-1 block w-full rounded-md border border-ink-650 bg-ink-900 px-2 py-1.5 text-xs normal-case text-white"
+                  >
+                    <option value="3">3s</option>
+                    <option value="5">5s</option>
+                    <option value="custom">Custom…</option>
+                  </select>
+                </label>
+                <label className="text-[10px] uppercase tracking-wide text-ink-400">
+                  Max seconds
+                  <input
+                    type="number"
+                    min={1}
+                    step={0.5}
+                    value={maxSeconds ?? capSeconds}
+                    onChange={(e) => {
+                      setLengthPreset("custom");
+                      setMaxSeconds(Number(e.target.value) || null);
+                    }}
+                    className="mt-1 block w-full rounded-md border border-ink-650 bg-ink-900 px-2 py-1.5 text-xs text-white"
+                  />
+                </label>
+                <label className="text-[10px] uppercase tracking-wide text-ink-400">
+                  Min seconds
+                  <input
+                    type="number"
+                    min={0.2}
+                    step={0.1}
+                    value={minSeconds}
+                    onChange={(e) => setMinSeconds(Number(e.target.value) || 1)}
+                    className="mt-1 block w-full rounded-md border border-ink-650 bg-ink-900 px-2 py-1.5 text-xs text-white"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void handlePrepare(true)}
+                  disabled={stage === "preparing" || !granted}
+                  className="self-end rounded-md border border-ink-650 bg-ink-900 px-3 py-1.5 text-xs font-semibold text-white hover:border-accent-400 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {stage === "preparing" ? "Working…" : "Re-run"}
+                </button>
+              </div>
+              <p className="mt-2 text-[10px] text-ink-500">
+                Each scene gets one snapshot automatically. Change the
+                lengths and press Re-run to re-fetch them.
+              </p>
+            </div>
             <ConsentCheckbox />
             {!granted && stage === "loaded" && (
               <FlashOnView>
@@ -1488,7 +1505,7 @@ function ReferenceEditorInner() {
                   Check the box above once you&apos;re happy with the
                   trimmed range — scene detection starts automatically from
                   there, right here in your browser: no file leaves your
-                  device until each scene's clip is uploaded. The first
+                  device until each scene&apos;s clip is uploaded. The first
                   scene may take a little longer while the trimming engine
                   itself downloads.
                 </p>
@@ -1509,235 +1526,178 @@ function ReferenceEditorInner() {
         </p>
       )}
 
-      {/* --- Detected scenes + transfer -------------------------------------- */}
-      {(stage === "ready" || (stage === "preparing" && clips.length > 0)) &&
-        clips.length > 0 && (
-          <div className="space-y-3 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold text-white">
-                {clips.length === 1
-                  ? "Clip ready"
-                  : `${clips.length} scene${clips.length === 1 ? "" : "s"} found — ${selectedJobs.length} selected`}
-              </h2>
-              {clips.length > 1 && (
-                <div className="flex shrink-0 gap-2 text-[11px]">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIncluded(
-                        Object.fromEntries(clips.map((c) => [c.job.id, true])),
-                      )
-                    }
-                    className="text-accent-400 underline underline-offset-2 hover:text-white"
-                  >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIncluded(
-                        Object.fromEntries(clips.map((c) => [c.job.id, false])),
-                      )
-                    }
-                    className="text-accent-400 underline underline-offset-2 hover:text-white"
-                  >
-                    None
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Stacked, full-width cards rather than a tight grid — each
-                scene tile now carries its own snap-taking scrubber (see
-                SceneSnapTaker below), which needs real width to be usable,
-                and with detection running automatically for every scene at
-                once (see the auto-trigger effect above) there's no longer a
-                "just glance at the thumbnails" grid use case this was
-                originally sized for. */}
+      {/* --- Snapshots + transfer ------------------------------------------- */}
+      {clips.length > 0 && (
+        <div className="space-y-3 rounded-xl border border-accent-500/30 bg-accent-500/[0.06] p-4">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-white">
+              {clips.length} scene{clips.length === 1 ? "" : "s"} —{" "}
+              {selectedJobs.length} selected
+            </h2>
             {clips.length > 1 && (
-              <FlashOnView>
-                <p className="rounded-md border border-accent-500/30 bg-accent-500/[0.08] px-2.5 py-1.5 text-[11px] leading-snug text-accent-400">
-                  Save order matters: whichever scene or snap you save a
-                  selection for first becomes Image 1 in Mic Studio, the
-                  next becomes Image 2, and so on — not the order these
-                  cards are laid out in.
-                </p>
-              </FlashOnView>
+              <div className="flex shrink-0 gap-2 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIncluded(Object.fromEntries(clips.map((c) => [c.job.id, true])));
+                    setSnapIncluded({});
+                  }}
+                  className="text-accent-400 underline underline-offset-2 hover:text-white"
+                >
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIncluded(Object.fromEntries(clips.map((c) => [c.job.id, false])));
+                    setSnapIncluded(
+                      Object.fromEntries(
+                        clips.flatMap((c) => c.snaps.map((sn) => [sn.id, false])),
+                      ),
+                    );
+                  }}
+                  className="text-accent-400 underline underline-offset-2 hover:text-white"
+                >
+                  None
+                </button>
+              </div>
             )}
-            <div className="flex flex-col gap-3">
-              {clips.map((c, i) => {
-                const isIncluded = included[c.job.id] !== false;
-                return (
-                  <label
-                    key={c.job.id}
-                    className={`relative block cursor-pointer overflow-hidden rounded-lg border transition ${
-                      isIncluded
-                        ? "border-accent-400"
-                        : "border-ink-650 opacity-50"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={isIncluded}
-                      onChange={(e) =>
-                        setIncluded((prev) => ({
-                          ...prev,
-                          [c.job.id]: e.target.checked,
-                        }))
-                      }
-                      className="absolute right-1.5 top-1.5 z-10 h-4 w-4 accent-accent-500"
-                    />
-                    {c.thumbnail ? (
-                      // A fixed-height, letterboxed frame rather than a
-                      // forced 16:9 crop — these reference clips are just as
-                      // often 9:16, and cropping or stretching a portrait
-                      // thumbnail into a landscape box is what made this
-                      // tile look warped before. object-contain keeps the
-                      // actual frame undistorted; the dark bars fill
-                      // whatever's left in the box.
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={c.thumbnail}
-                        alt=""
-                        className="flex h-32 w-full items-center justify-center bg-ink-900 object-contain"
-                      />
+          </div>
+
+          <FlashOnView>
+            <p className="rounded-md border border-accent-500/30 bg-accent-500/[0.08] px-2.5 py-1.5 text-[11px] leading-snug text-accent-400">
+              Snapshots reach Mic Studio in this order — left to right is
+              Image 1, Image 2, and so on. Tap one to edit objects on it;
+              untick any you don&apos;t want sent.
+            </p>
+          </FlashOnView>
+
+          <div className="flex flex-wrap gap-2.5">
+            {clips.map((c, i) => {
+              const isIncluded = included[c.job.id] !== false;
+              const snap = c.snaps[0] ?? null;
+              const preview = snap ? snapPreviewUrl(snap) : c.thumbnail;
+              const edited =
+                !!snap && snap.elements.some((el) => el.status === "completed");
+              return (
+                <div
+                  key={c.job.id}
+                  className={`w-28 shrink-0 overflow-hidden rounded-lg border bg-ink-900 transition ${
+                    isIncluded ? "border-accent-400" : "border-ink-650 opacity-50"
+                  }`}
+                >
+                  <div className="relative h-28 bg-black">
+                    {preview ? (
+                      <button
+                        type="button"
+                        disabled={!snap}
+                        onClick={() =>
+                          snap &&
+                          setSelectorSnap({ clipId: c.job.id, snapId: snap.id })
+                        }
+                        title={snap ? "Tap to select objects on this snapshot" : undefined}
+                        className="absolute inset-0 h-full w-full"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={preview} alt="" className="h-full w-full object-contain" />
+                        {edited && (
+                          <span className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-accent-400" />
+                        )}
+                      </button>
                     ) : (
-                      <div className="flex h-32 w-full items-center justify-center bg-ink-900 text-[10px] text-ink-500">
+                      <div className="flex h-full items-center justify-center text-[10px] text-ink-500">
                         No preview
                       </div>
                     )}
-                    {c.thumbnail && (
+                    <input
+                      type="checkbox"
+                      checked={isIncluded}
+                      title="Send this snapshot to Mic Studio"
+                      onChange={(e) => {
+                        setIncluded((prev) => ({ ...prev, [c.job.id]: e.target.checked }));
+                        if (snap)
+                          setSnapIncluded((prev) => ({ ...prev, [snap.id]: e.target.checked }));
+                      }}
+                      className="absolute left-1 top-1 z-10 h-4 w-4 accent-accent-500"
+                    />
+                    {preview && (
                       <button
                         type="button"
-                        disabled={downloadingId === `${c.job.id}-thumb`}
-                        title="Download this scene's thumbnail as an image"
-                        aria-label="Download this scene's thumbnail as an image"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          void handleThumbnailDownload(
-                            `${c.job.id}-thumb`,
-                            c.thumbnail!,
-                            `scene-${i + 1}.jpg`,
-                          );
-                        }}
-                        className="absolute left-1.5 top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded bg-black/70 text-[11px] text-white hover:bg-black disabled:opacity-60"
+                        disabled={downloadingId === c.job.id}
+                        title="Download this snapshot as an image"
+                        aria-label="Download this snapshot as an image"
+                        onClick={() =>
+                          void handleThumbnailDownload(c.job.id, preview, `scene-${i + 1}.jpg`)
+                        }
+                        className="absolute bottom-1 left-1 z-10 flex h-5 w-5 items-center justify-center rounded bg-black/70 text-[11px] text-white hover:bg-black disabled:opacity-60"
                       >
-                        {downloadingId === `${c.job.id}-thumb` ? "…" : "🖼"}
+                        {downloadingId === c.job.id ? "…" : "↓"}
                       </button>
                     )}
-                    <div className="flex items-center justify-between gap-1.5 bg-ink-850 px-2 py-1 text-[10px] text-ink-300">
-                      <span className="truncate">
-                        Scene {i + 1} ·{" "}
-                        {c.job.referenceVideoDurationSeconds.toFixed(1)}s
-                      </span>
-                      <span className="flex shrink-0 items-center gap-2">
-                        <a
-                          href={c.job.referenceVideoUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title="Open this clip's video"
-                          onClick={(e) => e.stopPropagation()}
-                          className="text-accent-400 underline underline-offset-2 hover:text-white"
-                        >
-                          ↗
-                        </a>
-                        <button
-                          type="button"
-                          disabled={downloadingId === c.job.id}
-                          title="Download this clip's video"
-                          aria-label="Download this clip's video"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            void handleThumbnailDownload(
-                              c.job.id,
-                              c.job.referenceVideoUrl,
-                              `scene-${i + 1}.mp4`,
-                            );
-                          }}
-                          className="text-accent-400 hover:text-white disabled:opacity-60"
-                        >
-                          {downloadingId === c.job.id ? "…" : "↓"}
-                        </button>
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        // Opening the selector isn't about this checkbox —
-                        // without this, the click would also toggle include
-                        // state, since the whole tile is a <label>.
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSelectorClipId(c.job.id);
-                      }}
-                      className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-center text-[10px] text-accent-400 hover:bg-ink-850 hover:text-white"
-                    >
-                      {c.clipEdit
-                        ? "Selections set — edit →"
-                        : "Select objects →"}
-                    </button>
-                    {/* This beat's on-screen text, if any — fed verbatim
-                        into /api/compose-prompt as this clip's own
-                        "Headline:" line (see PreparedClip.headline and
-                        continueInStudio). Click/focus stopped from
-                        bubbling so typing here doesn't also toggle the
-                        tile's own include checkbox, since the whole tile
-                        is a <label>. */}
-                    <input
-                      type="text"
-                      value={c.headline}
-                      onChange={(e) =>
-                        setClipHeadline(c.job.id, e.target.value)
-                      }
-                      onClick={(e) => e.stopPropagation()}
-                      placeholder="Headline for this beat (optional)"
-                      className="block w-full border-t border-ink-650 bg-ink-900 px-2 py-1 text-[10px] text-ink-200 placeholder:text-ink-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
-                    />
-                    {/* This scene's own snap-taking control — scoped to
-                        just this clip's [start, end] span (see
-                        SceneSnapTaker's own doc comment for why this
-                        replaced the old single global snap-taker). */}
-                    <div className="border-t border-ink-650 p-2">
-                      <SceneSnapTaker
-                        sourceUrl={sourceUrl}
-                        start={c.start}
-                        end={c.end}
-                        onTakeSnap={(dataUrl, atSeconds) =>
-                          handleTakeSnap(c.job.id, dataUrl, atSeconds)
-                        }
-                      />
-                    </div>
-                    {renderSnapRow(c)}
-                  </label>
-                );
-              })}
-            </div>
+                  </div>
+                  <div className="px-1.5 py-1 text-center text-[10px] text-ink-300">
+                    Scene {i + 1} · {c.job.referenceVideoDurationSeconds.toFixed(1)}s
+                  </div>
+                  <input
+                    type="text"
+                    value={c.headline}
+                    onChange={(e) => setClipHeadline(c.job.id, e.target.value)}
+                    placeholder="Headline (optional)"
+                    className="block w-full border-t border-ink-650 bg-ink-900 px-1.5 py-1 text-[10px] text-ink-200 placeholder:text-ink-500 focus:outline-none focus:ring-1 focus:ring-accent-500"
+                  />
+                </div>
+              );
+            })}
+          </div>
 
-            <button
-              type="button"
-              onClick={() => void continueInStudio()}
-              disabled={
-                stage !== "ready" ||
-                selectedJobs.length === 0 ||
-                navigatingToStudio
-              }
-              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
+          {/* Final prompt — written from the checked snapshots in order,
+              editable before it goes to Mic Studio. */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-[10px] font-medium uppercase tracking-[0.09em] text-accent-400">
+                Final prompt
+              </label>
+              <button
+                type="button"
+                onClick={() => void generatePrompt()}
+                disabled={generatingPrompt || selectedJobs.length === 0 || stage === "preparing"}
+                className="rounded-md border border-ink-650 bg-ink-850 px-2.5 py-1 text-[11px] font-semibold text-white hover:border-accent-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {generatingPrompt ? "Writing…" : finalPrompt ? "Regenerate prompt" : "Generate prompt"}
+              </button>
+            </div>
+            <textarea
+              value={finalPrompt}
+              onChange={(e) => setFinalPrompt(e.target.value)}
+              rows={6}
+              placeholder="Press Generate prompt to write one from the checked snapshots, in order — or type your own. Left empty, one is written automatically when you continue."
+              className="w-full resize-y rounded-md border border-ink-650 bg-ink-900 px-2.5 py-2 text-xs text-white outline-none placeholder:text-ink-500 focus:border-accent-500"
+            />
+            <p
+              className={`text-right text-[10px] ${
+                finalPrompt.length > model.maxPromptChars ? "text-red-400" : "text-ink-500"
+              }`}
             >
-              {navigatingToStudio ? "Opening Studio…" : "Continue in Mic Studio →"}
-            </button>
-            <p className="text-center text-[11px] text-ink-400">
-              Opens Studio with {model?.label} already loaded into Reference
-              mode:{" "}
-              {selectedJobs.length === 1
-                ? "the selected clip's video and its own reference image(s)."
-                : `the first selected clip's video, with all ${selectedJobs.length} selected clips' reference images combined in order.`}{" "}
-              Nothing generates and no credit is spent until you review it
-              there and press Generate yourself.
+              {finalPrompt.length} / {model.maxPromptChars}
             </p>
           </div>
-        )}
+
+          <button
+            type="button"
+            onClick={() => void continueInStudio()}
+            disabled={stage !== "ready" || selectedJobs.length === 0 || navigatingToStudio}
+            className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
+          >
+            {navigatingToStudio ? "Opening Studio…" : "Continue in Mic Studio →"}
+          </button>
+          <p className="text-center text-[11px] text-ink-400">
+            Opens Studio with {model?.label} in Reference mode: the first
+            checked scene&apos;s video, plus every checked snapshot as an
+            image reference, in order. Nothing generates and no credit is
+            spent until you press Generate there.
+          </p>
+        </div>
+      )}
 
       {/* --- Coming next ----------------------------------------------- */}
       <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
