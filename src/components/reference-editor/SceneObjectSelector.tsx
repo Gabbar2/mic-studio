@@ -1051,13 +1051,9 @@ export default function SceneObjectSelector({
               Close
             </button>
           </div>
-          <p className="text-[11px] leading-relaxed text-ink-400">
-            Tap a suggested object below the frame to add it, or describe
-            anything else — e.g. &quot;the red jacket&quot; or &quot;the
-            background wall&quot; — and press Detect. Each element appears in
-            the list below; tap its{" "}
-            <span className="text-accent-300">✨</span> icon to write what
-            should happen to it and attach reference images, then Save.
+          <p className="truncate text-[11px] text-ink-400">
+            Tap an object or describe one, press Detect, then tap{" "}
+            <span className="text-accent-300">✨</span> to edit it.
           </p>
 
           {sessionImageUrl && (
