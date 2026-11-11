@@ -1060,6 +1060,20 @@ export default function SceneObjectSelector({
             should happen to it and attach reference images, then Save.
           </p>
 
+          {sessionImageUrl && (
+            <div className="rounded-lg border border-accent-500/40 bg-accent-500/[0.06] p-2">
+              <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-accent-400">
+                Final Edit — all edits combined
+              </p>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={sessionImageUrl}
+                alt="Final edited result"
+                className="mx-auto max-h-48 w-auto rounded-md object-contain"
+              />
+            </div>
+          )}
+
           {loadingFrame && (
             <div className="flex h-48 items-center justify-center text-xs text-ink-400">
               Preparing a frame from this clip…
