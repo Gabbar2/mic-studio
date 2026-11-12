@@ -190,7 +190,7 @@ export default function TrimTimeline({
 
           {/* Selected range */}
           <div
-            className="pointer-events-none absolute inset-y-0 border-y-2 border-accent-400 bg-accent-500/25"
+            className={`pointer-events-none absolute inset-y-0 border-y-2 ${overCap ? "border-red-500 bg-red-500/30" : "border-accent-400 bg-accent-500/25"}`}
             style={{ left: `${startPct}%`, width: `${endPct - startPct}%` }}
           />
 
@@ -217,7 +217,7 @@ export default function TrimTimeline({
           className={`absolute inset-y-0 w-3 touch-none rounded-sm ${
             locked
               ? "cursor-not-allowed bg-ink-600"
-              : "cursor-ew-resize bg-accent-400"
+              : overCap ? "cursor-ew-resize bg-red-500" : "cursor-ew-resize bg-accent-400"
           }`}
           style={{ left: `calc(${startPct}% - 6px)` }}
         />
@@ -232,7 +232,7 @@ export default function TrimTimeline({
           className={`absolute inset-y-0 w-3 touch-none rounded-sm ${
             locked
               ? "cursor-not-allowed bg-ink-600"
-              : "cursor-ew-resize bg-accent-400"
+              : overCap ? "cursor-ew-resize bg-red-500" : "cursor-ew-resize bg-accent-400"
           }`}
           style={{ left: `calc(${endPct}% - 6px)` }}
         />
@@ -262,12 +262,9 @@ export default function TrimTimeline({
       </div>
 
       {overCap && (
-        <p className="rounded-lg border border-amber-500/30 bg-amber-500/[0.08] px-3 py-2 text-[11px] leading-relaxed text-amber-200">
-          This model&apos;s reference video tops out at {fmt(capSeconds)}.
-          Your {fmt(selected)} selection will be split into even clips at
-          that length when you prepare it — nothing outside your selection
-          is discarded, and no footage inside it is dropped either. Trim
-          further above if you&apos;d rather send one clip instead.
+        <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] text-red-300">
+          {fmt(selected)} selected — over this model&apos;s {fmt(capSeconds)}{" "}
+          limit, so it will be split into clips.
         </p>
       )}
     </div>
