@@ -234,6 +234,16 @@ export default function SceneObjectSelector({
   );
   const [generating, setGenerating] = useState(false);
   const messageSeq = useRef(0);
+  // The running composite as it was when the current chat was opened — what
+  // "Reset chat" rolls back to, so a discarded chat's edits also leave the
+  // combined Final Edit image.
+  const sessionAtOpenRef = useRef<string | null>(null);
+  // The one-line help text stays highlighted for its first 5 seconds.
+  const [hintOn, setHintOn] = useState(true);
+  useEffect(() => {
+    const t = setTimeout(() => setHintOn(false), 5000);
+    return () => clearTimeout(t);
+  }, []);
   const editingElement =
     elements.find((e) => e.elementId === editingElementId) ?? null;
 
@@ -653,6 +663,7 @@ export default function SceneObjectSelector({
   }
 
   function openEditor(el: ElementRecord) {
+    sessionAtOpenRef.current = sessionImageUrl;
     setEditingElementId(el.elementId);
     setDraftLabel(el.label);
     // A previously saved instruction — and its generated result, if this
@@ -672,6 +683,17 @@ export default function SceneObjectSelector({
     setDraftAttachments(el.attachments);
     setLastGeneratedUrl(el.generatedImageUrl);
     setEditorError(null);
+  }
+
+  /** Clears this element's chat — messages, composer, last result — and
+   * rolls the combined Final Edit image back to how it was before this chat. */
+  function resetChat() {
+    if (generating) return;
+    setDraftMessages([]);
+    setComposeText("");
+    setLastGeneratedUrl(null);
+    setEditorError(null);
+    setSessionImageUrl(sessionAtOpenRef.current);
   }
 
   /**
@@ -1051,7 +1073,13 @@ export default function SceneObjectSelector({
               Close
             </button>
           </div>
-          <p className="truncate text-[11px] text-ink-400">
+          <p
+            className={`truncate rounded-md px-2 py-1 text-[11px] transition-colors duration-700 ${
+              hintOn
+                ? "bg-accent-500/25 text-white ring-1 ring-accent-500/60"
+                : "bg-transparent text-ink-400 ring-1 ring-transparent"
+            }`}
+          >
             Tap an object or describe one, press Detect, then tap{" "}
             <span className="text-accent-300">✨</span> to edit it.
           </p>
@@ -1520,6 +1548,16 @@ export default function SceneObjectSelector({
                       className="text-ink-400 hover:text-white disabled:cursor-wait disabled:opacity-50"
                     >
                       {regenerating ? "…" : "↻"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={resetChat}
+                      disabled={generating || draftMessages.length === 0}
+                      title="Reset chat"
+                      aria-label="Reset chat"
+                      className="text-[11px] text-ink-400 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Reset
                     </button>
                     <button
                       type="button"
