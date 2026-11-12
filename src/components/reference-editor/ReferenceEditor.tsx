@@ -567,7 +567,7 @@ function ReferenceEditorInner() {
         // Best-effort — a missing thumbnail just renders an empty tile
         // rather than failing the whole prepare flow (see videoThumbnail.ts).
         const midpoint = (seg.start + seg.end) / 2;
-        const thumbnail = await captureThumbnail(sourceUrl, midpoint);
+        const thumbnail = await captureThumbnail(sourceUrl, midpoint, 960, 960);
         // Every scene automatically gets ONE snapshot — its own midpoint
         // frame — instead of the person having to grab one by hand. It is
         // a normal SnapRecord, so tapping it opens the same "Select objects"
