@@ -1687,15 +1687,6 @@ function ReferenceEditorInner() {
         </div>
       )}
 
-      {/* --- Coming next ----------------------------------------------- */}
-      <div className="rounded-xl border border-ink-700 bg-ink-900/60 p-4 text-[11px] leading-relaxed text-ink-400">
-        <span className="font-medium text-ink-200">Coming next:</span>{" "}
-        real ChatGPT-based prompt optimization per element — each
-        element&apos;s instruction is used exactly as typed for now, combined
-        into one prompt once you press Done, which you can still edit further
-        once you land in Mic Studio.
-      </div>
-
       {selectorClip && meta && (
         <SceneObjectSelector
           sourceUrl={sourceUrl}
