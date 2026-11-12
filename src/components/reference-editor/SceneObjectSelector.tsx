@@ -1094,7 +1094,7 @@ export default function SceneObjectSelector({
                   style={
                     frameSize && frameSize.height >= frameSize.width
                       ? { height: 560, width: "auto", maxWidth: "none" }
-                      : { width: "100%", minWidth: 560, height: "auto", maxWidth: "none" }
+                      : { width: "100%", height: "auto" }
                   }
                   className="block select-none"
                 />
