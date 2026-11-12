@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import FlashOnView from "../FlashOnView";
 import TrimTimeline from "./TrimTimeline";
 import SceneObjectSelector from "./SceneObjectSelector";
@@ -220,7 +220,6 @@ function ReferenceEditorInner() {
   // once per loaded source, the moment consent is granted — not on every
   // re-render afterward. Reset to false by loadSource whenever a fresh
   // source comes in (see there).
-  const autoPreparedRef = useRef(false);
   // Uploaded URL per snap id, so building the hand-off twice (once for
   // "Generate prompt", again on Continue) doesn't upload the same raw
   // snapshot twice.
@@ -232,9 +231,9 @@ function ReferenceEditorInner() {
   // into a neighbour — 1s by default, since sub-second clips are what the
   // video models reject outright.
   const [lengthPreset, setLengthPreset] = useState<"3" | "5" | "custom">(
-    "custom",
+    "3",
   );
-  const [maxSeconds, setMaxSeconds] = useState<number | null>(null);
+  const [maxSeconds, setMaxSeconds] = useState<number | null>(3);
   const [minSeconds, setMinSeconds] = useState(1);
   // The final prompt shown (and editable) before hand-off.
   const [finalPrompt, setFinalPrompt] = useState("");
@@ -346,7 +345,6 @@ function ReferenceEditorInner() {
     // A fresh source means detection hasn't auto-run for it yet — see the
     // auto-trigger effect below, which this flag guards against re-firing
     // on every re-render once it has.
-    autoPreparedRef.current = false;
 
     const objectUrl = file ? URL.createObjectURL(file) : remoteUrl;
     setSourceUrl(objectUrl);
@@ -646,25 +644,7 @@ function ReferenceEditorInner() {
   // itself doesn't lock), but detection should never re-run just because of
   // that — only a genuinely new source (loadSource resets the ref) gets a
   // fresh auto-run.
-  useEffect(() => {
-    if (
-      granted &&
-      !autoPreparedRef.current &&
-      stage === "loaded" &&
-      model &&
-      meta &&
-      sourceUrl
-    ) {
-      autoPreparedRef.current = true;
-      void handlePrepare();
-    }
-    // handlePrepare intentionally omitted — it closes over state that
-    // changes every render (clips, range, etc.), and re-running this effect
-    // for those would defeat the whole point of autoPreparedRef gating a
-    // single fire. Every value this effect actually needs to decide
-    // whether to fire is listed below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [granted, stage, model, meta, sourceUrl]);
+
 
   const selectedJobs = clips
     .filter((c) => included[c.job.id] !== false)
@@ -1432,15 +1412,13 @@ function ReferenceEditorInner() {
           />
 
           {/* --- Prepare -------------------------------------------------- */}
-          {/* No button here anymore — checking the consent box below is
-              what starts scene detection (see the auto-trigger effect
-              above), running automatically rather than needing a separate
-              "Prepare clip(s)" click. */}
+          {/* Scene detection starts from the Fetch snapshots button below. */}
           <div className="space-y-2.5">
             {/* Scene-splitting controls — how long each scene may run and
                 how short one may be before it merges into its neighbour.
                 Re-run redoes detection with these values and replaces the
                 scenes/snapshots below. */}
+            <FlashOnView>
             <div className="rounded-lg border border-ink-650 bg-ink-850 p-3">
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <label className="text-[10px] uppercase tracking-wide text-ink-400">
@@ -1498,16 +1476,26 @@ function ReferenceEditorInner() {
                 lengths and press Re-run to re-fetch them.
               </p>
             </div>
+            </FlashOnView>
             <ConsentCheckbox />
+            <button
+              type="button"
+              onClick={() => void handlePrepare(clips.length > 0)}
+              disabled={!granted || stage === "preparing" || !model || !meta}
+              className="w-full rounded-xl bg-accent-500 px-4 py-3 text-sm font-semibold text-accent-ink shadow-lg shadow-accent-500/20 transition hover:bg-accent-400 disabled:cursor-not-allowed disabled:bg-ink-700 disabled:text-ink-400 disabled:shadow-none"
+            >
+              {stage === "preparing"
+                ? "Fetching snapshots…"
+                : clips.length > 0
+                  ? "Re-fetch snapshots"
+                  : "Fetch snapshots of each scene"}
+            </button>
             {!granted && stage === "loaded" && (
               <FlashOnView>
                 <p className="text-center text-[11px] text-ink-400">
-                  Check the box above once you&apos;re happy with the
-                  trimmed range — scene detection starts automatically from
-                  there, right here in your browser: no file leaves your
-                  device until each scene&apos;s clip is uploaded. The first
-                  scene may take a little longer while the trimming engine
-                  itself downloads.
+                  Tick the box above, then press Fetch snapshots — detection
+                  runs in your browser, and no file leaves your device until
+                  each scene&apos;s clip is uploaded.
                 </p>
               </FlashOnView>
             )}
